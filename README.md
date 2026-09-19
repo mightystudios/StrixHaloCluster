@@ -15,12 +15,28 @@ This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over 
 
 ### Caveats
 
+[Bosgame M5](https://strixhalo.wiki/Hardware/PCs/Bosgame_M5/) was selected as it was the least expensive 128GB Strix Halo option available in Aug 2026. However, it is limited by 2.5Gbps Ethernet and generic 20Gbps USB4 (not true Intel Thunderbolt). [OdinLink](https://github.com/Geramy/OdinLink-Five) is not compatible. TCP-over-USB4 has been the only workable option tested so far. These scripts are specific to that hardware and other [Sixunited AXB35](https://strixhalo.wiki/Hardware/Boards/Sixunited_AXB35/) motherboard systems.
+
+The goal of this configuration is `multiple concurrent users` with access to QWEN3.8-Flash-Next and ComfyUI instances. It is not designed for maximum throughput for a single user. 
+
 This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wi-Fi/Bluetooth radios. This is not a configuration to expose to the internet or public networks.
 
 The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU and memory. I chose this to keep as many resources free for the AI models as possible.
 
+
+### Benchmark
+
+- QWEN3.8-Flash-Next Q4_K_XL 512Ki context window, 3 parallel user slots:
+    - 382.1 tok/s prompt rate, 15.9 tok/s generation
+
+- TCP-over-USB4 throughput:
+    - ~9Gbps.
+
+Dashboard includes USB4 and Benchmark tests.
+
 ### Sample Dashboard
 ![sample dashboard](./dashboard/dashboard.png)
+...
 
 ## Architecture
 
@@ -118,6 +134,7 @@ before using the extended window in production.
 - Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
 - XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
 - SSH: `<node>:22` (OpenSSH server, installed and enabled by `setup-environment.sh`)
+
 
 All scripts are designed to be rerun safely. Use `--help` for the complete option list, review any `Action required` messages, and use `sudo qwen3d8-status` or `sudo usb4-cluster-status` for diagnostics. Rerunning `setup-qwen3d8.sh` on the server restarts the controller service so it always picks up a freshly rebuilt `llama-server` (for example after a vendored patch or commit update); this briefly interrupts any active inference.
 

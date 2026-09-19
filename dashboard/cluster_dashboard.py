@@ -851,13 +851,14 @@ def build_demo(app: DashboardApp) -> Any:
         gr.Markdown("# Strix Halo Cluster Dashboard")
         gr.Markdown(render_installed_configuration(app.config))
         status = gr.Markdown("Loading cluster status...")
+        details = gr.Markdown("Loading detailed telemetry...")
+
         error_log = gr.Textbox(
             label="Error log",
             lines=8,
             max_lines=20,
             interactive=False,
         )
-        details = gr.Markdown("Loading detailed telemetry...")
 
         gr.Markdown("## On-demand verification")
         gr.Markdown(
