@@ -1269,9 +1269,8 @@ IPERFUNIT
 SAMBA_DISCOVERY_ON=0
 
 configure_samba() {
-  # This is a per-node maintenance drop for Windows clients. Keep it separate
-  # from model and ComfyUI/NFS storage so an SMB client cannot modify shared
-  # inference data by accident.
+  # Keep the generic maintenance drop separate from model and ComfyUI storage.
+  # setup-comfyui.sh manages the intentional Windows share for shared assets.
   log "Setting up the '$XFER_SHARE' Windows file share at $XFER_ROOT"
 
   apt-get install -y samba samba-common-bin smbclient \

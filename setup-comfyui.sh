@@ -22,6 +22,8 @@ COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 LAN_NETS="${LAN_NETS:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
 CONFIGURE_FIREWALL="${CONFIGURE_FIREWALL:-1}"
+INSTALL_COMFY_SMB="${INSTALL_COMFY_SMB:-1}"
+COMFY_SMB_SHARE="${COMFY_SMB_SHARE:-comfyui}"
 
 COMFY_PY="${COMFY_PY:-3.12}"
 ROCM_GFX="${ROCM_GFX:-gfx1151}"
@@ -85,6 +87,7 @@ Usage:
 Installs only:
   - One local ComfyUI service on this node
   - One read-write NFS ComfyUI store shared by both nodes
+  - One anonymous read-write Windows workspace share at \\\\<server>\\$COMFY_SMB_SHARE
   - LAN access to this node's ComfyUI web service
 
 Required:
@@ -104,6 +107,7 @@ Paths and account:
   --comfy-root <path>          Shared store (default: $COMFY_ROOT)
   --comfy-dir <path>           Local checkout (default: <user-home>/ComfyUI)
   --local-cache <path>         Local temp/user cache (default: $COMFY_LOCAL_CACHE)
+  --smb-share-name <name>      Server-side Windows share (default: $COMFY_SMB_SHARE)
 
 ComfyUI:
   --port <port>                Web service port (default: $COMFYUI_PORT)
@@ -116,6 +120,7 @@ ComfyUI:
 
 Other:
   --lan-nets "<cidrs>"         Space-separated LAN ranges allowed through UFW
+  --no-smb-share              Do not configure Windows access to the shared store
   --no-firewall               Do not add UFW rules
   -h, --help                  Show this help
 
@@ -193,6 +198,11 @@ while [ "$#" -gt 0 ]; do
       COMFY_LOCAL_CACHE="$2"
       shift
       ;;
+    --smb-share-name)
+      need_arg "$1" "${2:-}"
+      COMFY_SMB_SHARE="$2"
+      shift
+      ;;
     --port)
       need_arg "$1" "${2:-}"
       COMFYUI_PORT="$2"
@@ -228,6 +238,9 @@ while [ "$#" -gt 0 ]; do
       need_arg "$1" "${2:-}"
       LAN_NETS="$2"
       shift
+      ;;
+    --no-smb-share)
+      INSTALL_COMFY_SMB=0
       ;;
     --no-firewall)
       CONFIGURE_FIREWALL=0
@@ -266,6 +279,13 @@ id "$TARGET_USER" >/dev/null 2>&1 || die "user '$TARGET_USER' does not exist; ru
 [[ "$COMFY_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "invalid shared-store path: $COMFY_ROOT"
 [[ "$COMFY_LOCAL_CACHE" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "invalid local-cache path: $COMFY_LOCAL_CACHE"
 [[ "$COMFY_MANAGER_SECURITY" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid Manager security level"
+[[ "$COMFY_SMB_SHARE" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || die "SMB share name may contain only letters, numbers, '.', '_', and '-'"
+case "${COMFY_SMB_SHARE,,}" in
+  global|homes|printers)
+    die "reserved SMB share name: $COMFY_SMB_SHARE"
+    ;;
+esac
 case "$COMFY_ROOT" in
   /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
     die "refusing unsafe shared-store path: $COMFY_ROOT"
@@ -293,7 +313,11 @@ done
 [[ "$COMFY_CACHE_LRU" =~ ^[0-9]+$ ]] || die "COMFY_CACHE_LRU must be a whole number"
 [ "${COMFY_CACHE_ACTIVE_GB%%.*}" -le "${COMFY_CACHE_INACTIVE_GB%%.*}" ] \
   || die "active cache must not exceed inactive cache"
-for value in "$COMFY_ENABLE_ASSETS" "$COMFY_DISABLE_API_NODES" "$CONFIGURE_FIREWALL"; do
+for value in \
+    "$COMFY_ENABLE_ASSETS" \
+    "$COMFY_DISABLE_API_NODES" \
+    "$CONFIGURE_FIREWALL" \
+    "$INSTALL_COMFY_SMB"; do
   case "$value" in
     0|1) ;;
     *) die "boolean settings must be 0 or 1" ;;
@@ -370,13 +394,42 @@ ensure_share_group() {
   ok "$TARGET_USER added to $SHARE_GROUP, render, and video"
 }
 
+normalize_shared_workspace_permissions() {
+  local directory
+  local workspace_path
+  local invalid_path
+
+  [ "$IS_SERVER" = "1" ] || return 0
+
+  log "Normalizing shared ComfyUI workspace permissions"
+  for directory in models custom_nodes input output workflows; do
+    workspace_path="$COMFY_ROOT/$directory"
+    [ -d "$workspace_path" ] || continue
+
+    chgrp -hR "$SHARE_GROUP" "$workspace_path"
+    chmod -R g+rwX "$workspace_path"
+    find "$workspace_path" -xdev -type d -exec chmod g+s {} +
+    find "$workspace_path" -xdev -type d \
+      -exec setfacl -m "d:g:$SHARE_GROUP:rwx,d:m::rwx" {} +
+
+    invalid_path="$(
+      find "$workspace_path" -xdev \
+        \( \( -type d ! -perm -2070 \) -o \( -type f ! -perm -0060 \) \) \
+        -print -quit
+    )"
+    [ -z "$invalid_path" ] \
+      || die "shared asset path is not group-writable after repair: $invalid_path"
+  done
+  ok "shared workspace folders inherit read-write access for group '$SHARE_GROUP'"
+}
+
 # =============================================================================
 # 2. SHARED NFS STORE
 # =============================================================================
 export DEBIAN_FRONTEND=noninteractive
 log "Installing ComfyUI and shared-store prerequisites"
 apt-get update -y
-BASE_PACKAGES=(ca-certificates curl git sudo findutils coreutils util-linux iputils-ping)
+BASE_PACKAGES=(acl ca-certificates curl git sudo findutils coreutils util-linux iputils-ping)
 [ "$CONFIGURE_FIREWALL" = "1" ] && BASE_PACKAGES+=(ufw)
 apt-get install -y "${BASE_PACKAGES[@]}"
 ensure_share_group
@@ -387,9 +440,10 @@ configure_shared_store_server() {
   apt-get install -y nfs-kernel-server
 
   install -d -m 2775 -o "$TARGET_USER" -g "$SHARE_GROUP" "$COMFY_ROOT"
-  for directory in models input output workflows hf; do
+  for directory in models custom_nodes input output workflows hf; do
     install -d -m 2775 -o "$TARGET_USER" -g "$SHARE_GROUP" "$COMFY_ROOT/$directory"
   done
+  normalize_shared_workspace_permissions
 
   install -d -m 0755 /etc/nfs.conf.d
   cat > /etc/nfs.conf.d/10-comfyui-cluster.conf <<NFSCONF
@@ -491,7 +545,141 @@ fi
 echo
 
 # =============================================================================
-# 3. COMFYUI CHECKOUT, PYTHON ENVIRONMENT, AND SHARED LINKS
+# 3. WINDOWS ACCESS TO THE SHARED ASSET STORE
+# =============================================================================
+configure_comfy_smb_share() {
+  local smb_conf=/etc/samba/smb.conf
+  local smb_tmp
+  local probe_file
+  local probe_readback
+  local probe_dir
+  local probe_name
+  local probe_target
+  local smb_probe
+  local directory
+  local probe_failed=0
+  local -a probe_targets
+
+  log "Sharing $COMFY_ROOT with Windows as '$COMFY_SMB_SHARE'"
+
+  apt-get install -y samba samba-common-bin smbclient \
+    || die "failed to install Samba; use --no-smb-share to leave the share out"
+  ok "Samba $(dpkg-query -W -f='${Version}' samba 2>/dev/null) installed"
+
+  install -d -m 0755 "$(dirname "$smb_conf")"
+  [ -f "$smb_conf" ] || printf '[global]\n' > "$smb_conf"
+  [ -f "${smb_conf}.qwen3d8-cluster-orig" ] \
+    || cp -a "$smb_conf" "${smb_conf}.qwen3d8-cluster-orig"
+
+  smb_tmp="$(mktemp)"
+  sed '/qwen3d8-comfyui-smb BEGIN/,/qwen3d8-comfyui-smb END/d' \
+    "$smb_conf" > "$smb_tmp"
+
+  if awk -v expected="$COMFY_SMB_SHARE" '
+      /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+        section = $0
+        sub(/^[[:space:]]*\[/, "", section)
+        sub(/\][[:space:]]*$/, "", section)
+        if (tolower(section) == tolower(expected)) {
+          found = 1
+        }
+      }
+      END { exit found ? 0 : 1 }
+    ' "$smb_tmp"; then
+    rm -f "$smb_tmp"
+    die "SMB share '$COMFY_SMB_SHARE' already exists outside the managed ComfyUI block"
+  fi
+
+  {
+    echo
+    echo "# ==== qwen3d8-comfyui-smb BEGIN - managed by $SCRIPT_NAME, edits here are lost ===="
+    cat <<SMBCONF
+[global]
+   server min protocol = SMB2
+   client min protocol = SMB2
+   map to guest = Bad User
+   guest account = $TARGET_USER
+
+[$COMFY_SMB_SHARE]
+   comment = Shared ComfyUI workspace on $MY_HOST
+   path = $COMFY_ROOT
+   browseable = yes
+   read only = no
+   guest ok = yes
+   guest only = yes
+   force user = $TARGET_USER
+   force group = $SHARE_GROUP
+   create mask = 0664
+   force create mode = 0664
+   directory mask = 2775
+   force directory mode = 2775
+   veto files = /.cluster-ids/hf/
+   delete veto files = no
+SMBCONF
+    echo "# ==== qwen3d8-comfyui-smb END ===="
+  } >> "$smb_tmp"
+
+  if testparm -s "$smb_tmp" >/dev/null 2>&1; then
+    install -m 0644 "$smb_tmp" "$smb_conf"
+    ok "validated [$COMFY_SMB_SHARE] -> $COMFY_ROOT in $smb_conf"
+  else
+    warn "generated Samba configuration failed validation; $smb_conf was not changed"
+    { testparm -s "$smb_tmp" 2>&1 || true; } | sed 's/^/       /' | head -20 || true
+    rm -f "$smb_tmp"
+    return 1
+  fi
+  rm -f "$smb_tmp"
+
+  ensure_boot_unit smbd.service
+  if systemctl restart smbd.service >/dev/null 2>&1; then
+    ok "smbd running"
+  else
+    { systemctl status smbd.service --no-pager -n 8 2>&1 || true; } \
+      | sed 's/^/       /' | head -12 || true
+    die "smbd did not start; inspect: systemctl status smbd"
+  fi
+
+  probe_file="$(mktemp)"
+  probe_dir=".comfyui-smb-write-test-$$"
+  probe_name="probe.txt"
+  probe_targets=(models custom_nodes workflows input output)
+  for directory in models/background_removal models/checkpoints; do
+    if [ -d "$COMFY_ROOT/$directory" ]; then
+      probe_targets+=("$directory")
+      break
+    fi
+  done
+  printf 'ComfyUI SMB write test\n' > "$probe_file"
+  probe_readback="${probe_file}.readback"
+  for probe_target in "${probe_targets[@]}"; do
+    rm -f "$probe_readback"
+    if smb_probe="$(
+        smbclient "//127.0.0.1/$COMFY_SMB_SHARE" -N \
+          -c "cd \"$probe_target\"; mkdir \"$probe_dir\"; cd \"$probe_dir\"; put \"$probe_file\" \"$probe_name\"; get \"$probe_name\" \"$probe_readback\"; del \"$probe_name\"; cd ..; rmdir \"$probe_dir\"" 2>&1
+      )" && cmp -s "$probe_file" "$probe_readback"; then
+      ok "local anonymous SMB nested write test passed in $probe_target"
+    else
+      probe_failed=1
+      warn "the ComfyUI share failed its nested write test in $probe_target:"
+      printf '%s\n' "$smb_probe" | sed 's/^/       /' | head -8 || true
+    fi
+    rm -f "$COMFY_ROOT/$probe_target/$probe_dir/$probe_name"
+    rmdir "$COMFY_ROOT/$probe_target/$probe_dir" 2>/dev/null || true
+  done
+  rm -f "$probe_file" "$probe_readback"
+  warn "SMB clients can modify executable custom-node code; expose this share only to trusted LAN clients"
+  if [ "$probe_failed" = "1" ]; then
+    die "the SMB share is not read-write in every mapped folder; inspect with: smbclient //127.0.0.1/$COMFY_SMB_SHARE -N"
+  fi
+}
+
+if [ "$IS_SERVER" = "1" ] && [ "$INSTALL_COMFY_SMB" = "1" ]; then
+  configure_comfy_smb_share
+  echo
+fi
+
+# =============================================================================
+# 4. COMFYUI CHECKOUT, PYTHON ENVIRONMENT, AND SHARED LINKS
 # =============================================================================
 install_uv() {
   if command -v uv >/dev/null 2>&1; then
@@ -592,6 +780,142 @@ link_shared_pending_mount() {
   chown -h "$TARGET_USER:$TARGET_PRIMARY_GROUP" "$source" 2>/dev/null || true
 }
 
+normalize_shared_entry_as_user() {
+  local path="$1"
+
+  if [ -L "$path" ]; then
+    sudo -u "$TARGET_USER" -H chgrp -h "$SHARE_GROUP" "$path"
+    return
+  fi
+
+  sudo -u "$TARGET_USER" -H chgrp -hR "$SHARE_GROUP" "$path"
+  sudo -u "$TARGET_USER" -H chmod -R g+rwX "$path"
+  sudo -u "$TARGET_USER" -H find "$path" -xdev -type d -exec chmod g+s {} +
+  sudo -u "$TARGET_USER" -H find "$path" -xdev -type d \
+    -exec setfacl -m "d:g:$SHARE_GROUP:rwx,d:m::rwx" {} +
+}
+
+link_shared_custom_nodes() {
+  local source="$COMFY_DIR/custom_nodes"
+  local target="$COMFY_ROOT/custom_nodes"
+  local backup
+  local entry
+  local entry_name
+  local copy_error
+  local copy_failures=0
+  local duplicate_count=0
+  local migrated_count=0
+
+  install -d -m 2775 -o "$TARGET_USER" -g "$SHARE_GROUP" "$target" 2>/dev/null || true
+
+  if [ -L "$source" ]; then
+    if [ "$(readlink -f "$source")" = "$(readlink -f "$target")" ]; then
+      return 0
+    fi
+    rm -f "$source"
+  elif [ -d "$source" ]; then
+    if [ -z "$(ls -A "$source" 2>/dev/null)" ]; then
+      rmdir "$source"
+    elif [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
+      log "  migrating existing custom_nodes into the empty shared store"
+      if copy_error="$(
+          sudo -u "$TARGET_USER" -H cp -a -- "$source/." "$target/" 2>&1
+        )"; then
+        normalize_shared_entry_as_user "$target"
+        rm -rf "$source"
+      else
+        warn "could not migrate $source into $target; leaving it local"
+        [ -n "$copy_error" ] && warn "  ${copy_error%%$'\n'*}"
+        return 1
+      fi
+    else
+      backup="$COMFY_DIR/custom_nodes.local-before-sharing-$(date -u +%Y%m%dT%H%M%SZ)"
+      while [ -e "$backup" ]; do
+        backup="${backup}-${RANDOM}"
+      done
+
+      mv -- "$source" "$backup"
+      log "  merging peer-only custom nodes into the controller's shared store"
+      while IFS= read -r -d '' entry; do
+        entry_name="${entry##*/}"
+        if [ -e "$target/$entry_name" ] || [ -L "$target/$entry_name" ]; then
+          duplicate_count=$((duplicate_count + 1))
+          continue
+        fi
+
+        if copy_error="$(
+            sudo -u "$TARGET_USER" -H cp -a -- "$entry" "$target/" 2>&1
+          )"; then
+          normalize_shared_entry_as_user "$target/$entry_name"
+          migrated_count=$((migrated_count + 1))
+          ok "migrated peer-only custom node: $entry_name"
+        else
+          copy_failures=$((copy_failures + 1))
+          warn "could not migrate peer-only custom node '$entry_name'"
+          [ -n "$copy_error" ] && warn "  ${copy_error%%$'\n'*}"
+        fi
+      done < <(find "$backup" -mindepth 1 -maxdepth 1 -print0)
+
+      if [ "$duplicate_count" -gt 0 ]; then
+        warn "kept $duplicate_count controller copies instead of overwriting them from the peer"
+      fi
+      if [ "$migrated_count" -gt 0 ]; then
+        note_action "Install or repair dependencies for the $migrated_count peer-only custom nodes on $SERVER_HOST"
+      fi
+      note_action "Review and remove the preserved peer custom-node backup when no longer needed: $backup"
+      if [ "$copy_failures" -gt 0 ]; then
+        note_action "Manually reconcile $copy_failures custom-node entries that remain only in $backup"
+      fi
+    fi
+  elif [ -e "$source" ]; then
+    die "$source exists but is not a directory or symbolic link"
+  fi
+
+  ln -sfn "$target" "$source"
+  chown -h "$TARGET_USER:$TARGET_PRIMARY_GROUP" "$source" 2>/dev/null || true
+}
+
+verify_shared_workspace_access() {
+  local directory
+  local test_dir
+  local test_file
+  local expected
+  local actual
+
+  log "Verifying shared ComfyUI workspace read-write access"
+  expected="ComfyUI shared write test from $MY_HOST"
+
+  for directory in models custom_nodes input output workflows; do
+    [ -d "$COMFY_ROOT/$directory" ] \
+      || die "required shared folder is missing: $COMFY_ROOT/$directory"
+
+    test_dir="$COMFY_ROOT/$directory/.comfyui-rw-test-$MY_HOST-$$"
+    test_file="$test_dir/probe.txt"
+
+    if ! sudo -u "$TARGET_USER" -H mkdir -- "$test_dir"; then
+      die "$TARGET_USER cannot create directories in $COMFY_ROOT/$directory"
+    fi
+    if ! printf '%s\n' "$expected" \
+        | sudo -u "$TARGET_USER" -H tee "$test_file" >/dev/null; then
+      rmdir "$test_dir" 2>/dev/null || true
+      die "$TARGET_USER cannot write files in $COMFY_ROOT/$directory"
+    fi
+
+    actual="$(sudo -u "$TARGET_USER" -H cat "$test_file" 2>/dev/null || true)"
+    if [ "$actual" != "$expected" ]; then
+      rm -f "$test_file"
+      rmdir "$test_dir" 2>/dev/null || true
+      die "$TARGET_USER cannot read files in $COMFY_ROOT/$directory"
+    fi
+
+    sudo -u "$TARGET_USER" -H rm -- "$test_file" \
+      || die "$TARGET_USER cannot delete files in $COMFY_ROOT/$directory"
+    sudo -u "$TARGET_USER" -H rmdir -- "$test_dir" \
+      || die "$TARGET_USER cannot delete directories in $COMFY_ROOT/$directory"
+    ok "read-write access verified: $COMFY_ROOT/$directory"
+  done
+}
+
 if [ "$shared_store_ready" = "1" ]; then
   for pair in \
       "models:$COMFY_ROOT/models" \
@@ -600,6 +924,8 @@ if [ "$shared_store_ready" = "1" ]; then
     link_shared "${pair%%:*}" "${pair#*:}"
     ok "ComfyUI/${pair%%:*} -> ${pair#*:}"
   done
+  link_shared_custom_nodes
+  ok "ComfyUI/custom_nodes -> $COMFY_ROOT/custom_nodes"
 
   install -d -m 0755 -o "$TARGET_USER" -g "$TARGET_PRIMARY_GROUP" \
     "$COMFY_DIR/user" "$COMFY_DIR/user/default"
@@ -608,6 +934,7 @@ if [ "$shared_store_ready" = "1" ]; then
 else
   for pair in \
       "models:$COMFY_ROOT/models" \
+      "custom_nodes:$COMFY_ROOT/custom_nodes" \
       "input:$COMFY_ROOT/input" \
       "output:$COMFY_ROOT/output"; do
     link_shared_pending_mount "${pair%%:*}" "${pair#*:}"
@@ -619,6 +946,11 @@ else
   link_shared_pending_mount user/default/workflows "$COMFY_ROOT/workflows"
   ok "ComfyUI/user/default/workflows -> $COMFY_ROOT/workflows (pending NFS mount)"
 fi
+
+if [ "$IS_SERVER" = "1" ]; then
+  normalize_shared_workspace_permissions
+fi
+verify_shared_workspace_access
 
 cat > "$USER_HOME/.comfyui_provision.sh" <<'PROVISION'
 #!/usr/bin/env bash
@@ -651,6 +983,7 @@ fi
   "rocm-sdk-devel==${ROCM_VERSION}" \
   "rocm-sdk-device-gfx1151==${ROCM_VERSION}" \
   "torchvision==${TORCHVISION_EXPECTED_VERSION}" \
+  "amd-torchvision-device-gfx1151==${TORCHVISION_EXPECTED_VERSION}" \
   "torchaudio==${TORCHAUDIO_EXPECTED_VERSION}"
 
 grep -viE '^(torch|torchvision|torchaudio)([[:space:]<>=!~;]|$)' requirements.txt \
@@ -691,7 +1024,32 @@ fi
   "rocm-sdk-devel==${ROCM_VERSION}" \
   "rocm-sdk-device-gfx1151==${ROCM_VERSION}" \
   "torchvision==${TORCHVISION_EXPECTED_VERSION}" \
+  "amd-torchvision-device-gfx1151==${TORCHVISION_EXPECTED_VERSION}" \
   "torchaudio==${TORCHAUDIO_EXPECTED_VERSION}"
+
+echo "Validating torchvision deform_conv2d on the ROCm GPU"
+.venv/bin/python - <<'PY'
+import torch
+from torchvision.ops import deform_conv2d
+
+if not torch.cuda.is_available():
+    raise RuntimeError("ROCm GPU is not available to PyTorch")
+
+device = torch.device("cuda")
+input_tensor = torch.zeros((1, 1, 5, 5), device=device)
+offset = torch.zeros((1, 18, 3, 3), device=device)
+weight = torch.ones((1, 1, 3, 3), device=device)
+output = deform_conv2d(input_tensor, offset, weight)
+torch.cuda.synchronize()
+
+if output.shape != (1, 1, 3, 3):
+    raise RuntimeError(f"unexpected deform_conv2d output shape: {output.shape}")
+
+print(
+    "torchvision deform_conv2d GPU smoke test passed on "
+    f"{torch.cuda.get_device_name(device)}"
+)
+PY
 
 mkdir -p custom_nodes
 if [ -d custom_nodes/comfyui-url-downloader/.git ]; then
@@ -819,7 +1177,7 @@ else
 fi
 
 # =============================================================================
-# 4. COMFYUI SERVICE
+# 5. COMFYUI SERVICE
 # =============================================================================
 COMFY_ROCM_PATH="$COMFY_DIR/.venv/lib/python$COMFY_PY/site-packages/_rocm_sdk_core"
 cat > /etc/systemd/system/comfyui.service <<UNIT
@@ -864,17 +1222,20 @@ else
 fi
 
 # =============================================================================
-# 5. FIREWALL AND SUMMARY
+# 6. FIREWALL AND SUMMARY
 # =============================================================================
 configure_firewall() {
   [ "$CONFIGURE_FIREWALL" = "1" ] || return 0
 
-  log "Adding ComfyUI and NFS firewall rules"
+  log "Adding ComfyUI and shared-store firewall rules"
   ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
 
   local net
   for net in $LAN_NETS; do
     ufw allow from "$net" to any port "$COMFYUI_PORT" proto tcp >/dev/null
+    if [ "$IS_SERVER" = "1" ] && [ "$INSTALL_COMFY_SMB" = "1" ]; then
+      ufw allow from "$net" to any port 445 proto tcp >/dev/null
+    fi
   done
 
   if [ "$IS_SERVER" = "1" ]; then
@@ -884,7 +1245,11 @@ configure_firewall() {
   yes | ufw enable >/dev/null 2>&1 || true
   systemctl enable ufw.service >/dev/null 2>&1 || true
   if ufw status 2>/dev/null | grep '^Status: active' >/dev/null; then
-    ok "UFW active; ComfyUI is LAN-only and NFS is private-link-only"
+    if [ "$IS_SERVER" = "1" ] && [ "$INSTALL_COMFY_SMB" = "1" ]; then
+      ok "UFW active; ComfyUI and SMB are LAN-only and NFS is private-link-only"
+    else
+      ok "UFW active; ComfyUI is LAN-only and NFS is private-link-only"
+    fi
     if grep -E '^ENABLED=yes' /etc/ufw/ufw.conf >/dev/null 2>&1; then
       ok "UFW is configured to restore its rules at boot"
     else
@@ -909,10 +1274,14 @@ echo "  Web service:   http://$LAN_IP:$COMFYUI_PORT"
 echo "  Shared store:  $COMFY_ROOT"
 if [ "$IS_SERVER" = "1" ]; then
   echo "  NFS export:    $COMFY_ROOT -> $PEER_IP"
+  if [ "$INSTALL_COMFY_SMB" = "1" ]; then
+    echo "  Windows share: \\\\$LAN_IP\\$COMFY_SMB_SHARE -> $COMFY_ROOT"
+  fi
 else
   echo "  NFS source:    $SERVER_IP:$COMFY_ROOT"
 fi
-echo "  Local state:   $COMFY_DIR/custom_nodes, $COMFY_DIR/user, $COMFY_LOCAL_CACHE"
+echo "  Shared code:   $COMFY_DIR/custom_nodes -> $COMFY_ROOT/custom_nodes"
+echo "  Local state:   $COMFY_DIR/.venv, $COMFY_DIR/user, $COMFY_LOCAL_CACHE"
 
 if [ "${#ACTIONS[@]}" -gt 0 ]; then
   echo

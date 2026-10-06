@@ -7,7 +7,12 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from dashboard import cluster_dashboard, cluster_monitor, cluster_tests
+from dashboard import (
+    cluster_dashboard,
+    cluster_monitor,
+    cluster_node_agent,
+    cluster_tests,
+)
 
 
 class ClusterNetworkTests(unittest.TestCase):
@@ -373,6 +378,226 @@ class DashboardRestartTests(unittest.TestCase):
 
         self.assertTrue(response[0].startswith("[FAIL]"))
         self.assertIn("capacity test is running", response[0])
+
+
+class DashboardComfyuiRestartTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.refresh_result = ("summary", "history", "errors", "details")
+
+    def test_controller_restart_uses_restricted_helper(self) -> None:
+        app = cluster_dashboard.DashboardApp({"role": "server"})
+        completed = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with (
+            patch.object(
+                cluster_dashboard.subprocess, "run", return_value=completed
+            ) as run,
+            patch.object(app, "refresh", return_value=self.refresh_result),
+        ):
+            output, *_ = app.restart_comfyui("controller")
+
+        self.assertIn("[PASS]", output)
+        self.assertIn("controller: restart requested", output)
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "start",
+                cluster_dashboard.COMFYUI_RESTART_UNIT,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_peer_restart_uses_private_agent_and_token(self) -> None:
+        app = cluster_dashboard.DashboardApp(
+            {
+                "role": "server",
+                "peer_agent_url": "http://10.200.0.2:8765/",
+                "peer_agent_token_file": "/run/peer-token",
+            }
+        )
+
+        with (
+            patch.object(
+                cluster_dashboard, "read_token", return_value="test-token"
+            ),
+            patch.object(
+                cluster_dashboard,
+                "http_post_json",
+                return_value=(202, {"status": "accepted"}),
+            ) as post,
+            patch.object(app, "refresh", return_value=self.refresh_result),
+        ):
+            output, *_ = app.restart_comfyui("peer")
+
+        self.assertIn("[PASS]", output)
+        self.assertIn("peer: restart requested", output)
+        post.assert_called_once_with(
+            "http://10.200.0.2:8765/actions/restart-comfyui",
+            {},
+            timeout=30,
+            headers={"X-Cluster-Agent-Token": "test-token"},
+        )
+
+    def test_both_restart_attempts_controller_after_peer_failure(self) -> None:
+        app = cluster_dashboard.DashboardApp(
+            {
+                "role": "server",
+                "peer_agent_url": "http://10.200.0.2:8765",
+            }
+        )
+        completed = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with (
+            patch.object(
+                cluster_dashboard,
+                "http_post_json",
+                return_value=(500, {"error": "worker helper failed"}),
+            ),
+            patch.object(
+                cluster_dashboard.subprocess, "run", return_value=completed
+            ) as run,
+            patch.object(app, "refresh", return_value=self.refresh_result),
+        ):
+            output, *_ = app.restart_comfyui("both")
+
+        self.assertIn("[FAIL]", output)
+        self.assertIn("worker helper failed", output)
+        self.assertIn("controller: restart requested", output)
+        run.assert_called_once()
+
+    def test_restart_is_refused_while_test_is_running(self) -> None:
+        app = cluster_dashboard.DashboardApp({"role": "server"})
+        app._active_test = "capacity test"
+
+        with (
+            patch.object(cluster_dashboard.subprocess, "run") as run,
+            patch.object(cluster_dashboard, "http_post_json") as post,
+            patch.object(app, "refresh", return_value=self.refresh_result),
+        ):
+            output, *_ = app.restart_comfyui("both")
+
+        self.assertIn("[FAIL]", output)
+        self.assertIn("capacity test", output)
+        run.assert_not_called()
+        post.assert_not_called()
+
+
+class NodeAgentComfyuiRestartTests(unittest.TestCase):
+    def test_action_endpoint_enforces_token_and_starts_helper(self) -> None:
+        server = cluster_node_agent.ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            cluster_node_agent.AgentHandler,
+        )
+        server.agent_config = {
+            "role": "peer",
+            "peer_ip": "127.0.0.1",
+        }
+        server.agent_role = "peer"
+        server.agent_token = "test-token"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = int(server.server_address[1])
+        completed = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        try:
+            with patch.object(
+                cluster_node_agent.subprocess, "run", return_value=completed
+            ) as run:
+                forbidden_status, _ = cluster_monitor.http_post_json(
+                    f"http://127.0.0.1:{port}/actions/restart-comfyui",
+                    {},
+                )
+                accepted_status, body = cluster_monitor.http_post_json(
+                    f"http://127.0.0.1:{port}/actions/restart-comfyui",
+                    {},
+                    headers={"X-Cluster-Agent-Token": "test-token"},
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(forbidden_status, 403)
+        self.assertEqual(accepted_status, 202)
+        self.assertEqual(body["status"], "accepted")
+        run.assert_called_once()
+
+    def test_action_allows_only_configured_controller_on_peer(self) -> None:
+        config = {"role": "peer", "peer_ip": "10.200.0.1"}
+
+        self.assertTrue(
+            cluster_node_agent.controller_action_allowed(
+                config, "10.200.0.1"
+            )
+        )
+        self.assertFalse(
+            cluster_node_agent.controller_action_allowed(
+                config, "10.200.0.99"
+            )
+        )
+        self.assertFalse(
+            cluster_node_agent.controller_action_allowed(
+                {"role": "server", "peer_ip": "10.200.0.2"},
+                "10.200.0.2",
+            )
+        )
+
+    def test_peer_action_starts_only_restricted_helper(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with patch.object(
+            cluster_node_agent.subprocess, "run", return_value=completed
+        ) as run:
+            status, body = cluster_node_agent.request_comfyui_restart(
+                {"role": "peer"}
+            )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body["status"], "accepted")
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "start",
+                cluster_node_agent.COMFYUI_RESTART_UNIT,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_controller_agent_cannot_start_comfyui_helper(self) -> None:
+        with patch.object(cluster_node_agent.subprocess, "run") as run:
+            status, body = cluster_node_agent.request_comfyui_restart(
+                {"role": "server"}
+            )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["status"], "invalid_role")
+        run.assert_not_called()
 
 
 class InstalledConfigurationTests(unittest.TestCase):

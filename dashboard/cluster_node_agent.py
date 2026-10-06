@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only telemetry agent for the private cluster network."""
+"""Private telemetry and controlled-action agent for the cluster network."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ try:
     )
 except ImportError:
     from cluster_monitor import collect_node_snapshot, load_config, read_token, utc_now
+
+
+COMFYUI_RESTART_UNIT = "qwen3d8-comfyui-restart.service"
 
 
 def _run_iperf_direction(
@@ -119,8 +122,47 @@ def run_usb4_agent_test(
     return 200, {"status": "ok" if success else "failed", "results": results}
 
 
+def controller_action_allowed(config: dict[str, Any], client_ip: str) -> bool:
+    """Allow mutating worker actions only from the configured controller."""
+
+    if str(config.get("role", "")).lower() != "peer":
+        return False
+    controller_ip = str(config.get("peer_ip", ""))
+    return bool(controller_ip) and hmac.compare_digest(client_ip, controller_ip)
+
+
+def request_comfyui_restart(
+    config: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Start the restricted ComfyUI restart helper on the worker."""
+
+    if str(config.get("role", "")).lower() != "peer":
+        return 400, {"status": "invalid_role", "error": "worker role required"}
+    try:
+        completed = subprocess.run(
+            ["systemctl", "start", COMFYUI_RESTART_UNIT],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"status": "failed", "error": str(exc)}
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        return 500, {
+            "status": "failed",
+            "error": detail[:500] or f"systemctl exited {completed.returncode}",
+        }
+    return 202, {
+        "status": "accepted",
+        "message": "worker ComfyUI restart requested",
+    }
+
+
 class AgentHandler(BaseHTTPRequestHandler):
-    server_version = "StrixHaloNodeAgent/1"
+    server_version = "StrixHaloNodeAgent/2"
 
     def _json(self, status: int, body: dict[str, Any]) -> None:
         encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -156,16 +198,34 @@ class AgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(403, {"status": "forbidden", "error": "invalid agent token"})
             return
-        if self.path != "/tests/usb4":
+        if self.path not in {"/tests/usb4", "/actions/restart-comfyui"}:
             self._json(404, {"status": "not_found", "error": "unknown endpoint"})
             return
+        config = getattr(self.server, "agent_config")
+        if self.path == "/actions/restart-comfyui":
+            client_ip = str(self.client_address[0])
+            if not controller_action_allowed(config, client_ip):
+                self._json(
+                    403,
+                    {
+                        "status": "forbidden",
+                        "error": "restart actions require the configured controller",
+                    },
+                )
+                return
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"status": "invalid_request", "error": "invalid content length"})
+            self._json(
+                400,
+                {"status": "invalid_request", "error": "invalid content length"},
+            )
             return
         if content_length < 0 or content_length > 65536:
-            self._json(413, {"status": "invalid_request", "error": "request is too large"})
+            self._json(
+                413,
+                {"status": "invalid_request", "error": "request is too large"},
+            )
             return
         try:
             body = json.loads(self.rfile.read(content_length).decode("utf-8"))
@@ -173,10 +233,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._json(400, {"status": "invalid_request", "error": str(exc)})
             return
         if not isinstance(body, dict):
-            self._json(400, {"status": "invalid_request", "error": "JSON body must be an object"})
+            self._json(
+                400,
+                {
+                    "status": "invalid_request",
+                    "error": "JSON body must be an object",
+                },
+            )
             return
-        config = getattr(self.server, "agent_config")
-        status, response = run_usb4_agent_test(config, body)
+        if self.path == "/actions/restart-comfyui":
+            status, response = request_comfyui_restart(config)
+        else:
+            status, response = run_usb4_agent_test(config, body)
         self._json(status, response)
 
     def log_message(self, format_string: str, *args: Any) -> None:
@@ -204,8 +272,8 @@ def main() -> int:
         default="/etc/qwen3d8/dashboard.json",
         help="dashboard JSON configuration",
     )
-    parser.add_argument("--bind", help="address for the private telemetry listener")
-    parser.add_argument("--port", type=int, help="telemetry listener port")
+    parser.add_argument("--bind", help="address for the private agent listener")
+    parser.add_argument("--port", type=int, help="private agent listener port")
     args = parser.parse_args()
 
     config = load_config(args.config)

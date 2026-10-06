@@ -1,9 +1,9 @@
 # Strix Halo Cluster Dashboard
 
 This directory is intentionally independent from the cluster provisioning
-scripts. It contains the read-only node telemetry agent, the on-demand
-verification tests, the Gradio dashboard, and the installer for those
-components.
+scripts. It contains the private node telemetry and controlled-action agent,
+the on-demand verification tests, the Gradio dashboard, and the installer for
+those components.
 
 ## Install
 
@@ -31,9 +31,13 @@ The installer reads `/etc/qwen3d8/cluster.env` and
 - `qwen3d8-node-agent.service` on both nodes
 - `qwen3d8-dashboard.service` on the controller
 - `qwen3d8-server-restart.service` on the controller
+- `qwen3d8-comfyui-restart.service` on both nodes
 
 Rerunning the installer copies the current dashboard files and restarts its
 managed services, so it is also the supported way to deploy dashboard updates.
+When deploying this update to an existing cluster, rerun the worker installer
+first and the controller installer second so the private restart endpoint is
+available when the new dashboard becomes active.
 
 The controller dashboard includes a **Restart Qwen server** button. It starts a
 dedicated root-owned systemd helper through a polkit rule restricted to the
@@ -41,9 +45,21 @@ dashboard service account; it cannot directly control arbitrary services.
 Restarting interrupts active inference requests, and the dashboard remains
 degraded until the model finishes loading.
 
+The dashboard also includes **Restart controller ComfyUI**, **Restart peer
+ComfyUI**, and **Restart both ComfyUI workers** controls. Each node has a
+root-owned ComfyUI helper and a polkit rule that permits the dashboard service
+account to start only that helper. The combined action attempts both nodes
+even if one restart fails and reports each result. Restarting ComfyUI
+interrupts active workflows on the selected node, so use these controls only
+after current jobs finish.
+
 The worker agent listens only on the private cluster address. The dashboard
 defaults to port `7860`; the agent defaults to port `8765`. UFW rules are
-added for the private agent link and the configured LAN networks.
+added for the private agent link and the configured LAN networks. Its
+`POST /actions/restart-comfyui` endpoint is enabled only for the worker role,
+accepts requests only from the configured controller private IP, honors the
+optional agent token, and can start only the dedicated ComfyUI helper. It
+cannot control arbitrary systemd units.
 
 The capacity-test defaults are configurable at install time:
 
@@ -67,8 +83,9 @@ installed values remain the source of truth for configuration checks.
 For Q4, `--context 512` configures a 512 Ki per-slot context with 2x YaRN
 scaling from the model's native 256 Ki window.
 
-Because the dashboard can start a large capacity test, use basic authentication
-when it is reachable by more than a fully trusted LAN:
+Because the dashboard can start a large capacity test and restart cluster
+services, use basic authentication when it is reachable by more than a fully
+trusted LAN:
 
 ```bash
 sudo bash dashboard/setup-dashboard.sh \
@@ -137,6 +154,10 @@ rates from the latest triggered test. Run capacity tests when no production
 inference is active.
 
 ## Dashboard contents
+
+The **Service controls** section provides separate Qwen, controller ComfyUI,
+peer ComfyUI, and combined ComfyUI restart buttons. Every restart requires a
+browser confirmation and is refused while a dashboard diagnostic is running.
 
 The status area refreshes every five seconds and reports:
 

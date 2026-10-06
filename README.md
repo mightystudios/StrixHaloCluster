@@ -9,7 +9,8 @@ This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over 
 - Turnkey scripts. Start with a fresh Ubuntu install and the scripts handle all the rest.
 - The tested Bosgame M5 nodes are linked over USB4. The verifier targets at least 8 Gbit/s over the private link. A USB4 data cable is required. I use https://link.amazon/B03prmZHS
 - Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. To host up to three concurrent inference sessions, I use Q4 with 512 Ki tokens per slot.
-- ComfyUI is set up on both nodes. Each node runs its own ComfyUI instance, and both use a shared model/data store so models only need to be downloaded once for use on either node.
+- ComfyUI is set up on both nodes. Each node runs its own ComfyUI instance, and both use a shared workspace for models, custom-node source, workflows, inputs, and outputs.
+- The controller exposes the shared ComfyUI workspace as an anonymous, read/write `comfyui` share so Windows clients can manage models, custom-node source, workflows, inputs, and outputs without SSH.
 - Both nodes provide remote desktop services and each exposes an anonymous, read/write `xfer` folder on the network for maintenance from Windows clients.
 - Qwen3.8-Flash-Next sessions served by the cluster have been tested from Windows clients using Open WebUI in a web browser, [AnythingLLM](https://anythingllm.com/) on the desktop, VS Code [extensions](https://marketplace.visualstudio.com/items?itemName=AndrewButson.github-copilot-llm-gateway), and custom tools using the Copilot SDK.
 
@@ -19,7 +20,7 @@ This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over 
 
 The goal of this configuration is `multiple concurrent users` with access to QWEN3.8-Flash-Next and ComfyUI instances. It is not designed for maximum throughput for a single user. 
 
-This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wi-Fi/Bluetooth radios. This is not a configuration to expose to the internet or public networks.
+This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wi-Fi/Bluetooth radios. The `xfer` and `comfyui` shares are anonymous and read/write. This is not a configuration to expose to the internet or public networks.
 
 The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU and memory. I chose this to keep as many resources free for the AI models as possible.
 
@@ -58,11 +59,12 @@ The controller serves the LAN API and coordinates inference; the worker provides
 graph LR
     clients["LAN clients"] --> comfy_a["Controller ComfyUI<br/>:8188"]
     clients --> comfy_b["Worker ComfyUI<br/>:8188"]
-    comfy_a -->|local| store["Controller NFS store<br/>/srv/comfyui :2049"]
+    windows["Windows clients"] -->|SMB :445| store
+    comfy_a -->|local| store["Shared ComfyUI workspace<br/>/srv/comfyui :2049"]
     comfy_b -->|NFS over USB4| store
 ```
 
-Both nodes run ComfyUI. The controller owns the shared store and exports it to the worker over the private link. Samba file transfer and XRDP run on each node but are omitted from these focused diagrams.
+Both nodes run ComfyUI. The controller owns the shared workspace, exports it to the worker over the private link, and exposes its managed folders to Windows over SMB. XRDP and the per-node `xfer` shares are omitted from this focused diagram.
 
 ## Requirements
 
@@ -70,7 +72,7 @@ Both nodes run ComfyUI. The controller owns the shared store and exports it to t
 - Two nodes connected by USB4 and reachable by their LAN hostnames
 - An unprivileged Linux account on each node; use matching UID/GID values for the shared ComfyUI store
 - Sufficient local storage for the selected model and, if enabled, the optional peer RPC cache
-- A trusted LAN: the default Samba share is anonymous and read/write
+- A trusted LAN: the default Samba shares are anonymous and read/write
 
 The installer planning estimates are 110 GiB for Q4, 150 GiB for Q5, and 160 GiB for Q6. For a fresh download, allow roughly 129 GiB, 173 GiB, and 183 GiB of free space respectively because the installer reserves 25 GiB during download. The optional peer RPC disk cache is disabled by default. Q5 and Q6 are experimental on this two-node topology. If Hugging Face authentication is required, set `HF_TOKEN` and preserve it through `sudo`, for example: `sudo --preserve-env=HF_TOKEN bash setup-qwen3d8.sh ...`.
 
@@ -118,7 +120,7 @@ before using the extended window in production.
 | Script | Purpose |
 | --- | --- |
 | `setup-environment.sh` | Base node setup: USB4, Samba file drop, XRDP, SSH, and UFW |
-| `setup-comfyui.sh` | ComfyUI on each node with an NFS-shared model/data store |
+| `setup-comfyui.sh` | ComfyUI on each node with an NFS-shared workspace and controller-side Windows share |
 | `setup-qwen3d8.sh` | ROCm, `llama.cpp`, Qwen3.8 model, RPC services, and controller web UI |
 | `verify-environment.sh` | Checks services, networking, firewall rules, and USB4 throughput |
 | `dashboard/` | Independent telemetry agent, Python test runner, Gradio dashboard, and dashboard-only installer |
@@ -131,6 +133,7 @@ before using the extended window in production.
 - Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1/`
 - Cluster dashboard: `http://<controller>:7860` after installing `dashboard/setup-dashboard.sh`
 - ComfyUI: `http://<node>:8188`
+- Windows ComfyUI workspace: `\\<controller>\comfyui`
 - Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
 - XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
 - SSH: `<node>:22` (OpenSSH server, installed and enabled by `setup-environment.sh`)
@@ -141,12 +144,80 @@ All scripts are designed to be rerun safely. Use `--help` for the complete optio
 The dashboard is maintained separately from the provisioning scripts. See
 [`dashboard/README.md`](dashboard/README.md) for its installation, telemetry
 agent, configurable capacity tests, persistent token-rate statistics,
-command-line tests, and Gradio controls.
+command-line tests, restricted Qwen and ComfyUI restart controls, and Gradio
+interface.
 
 The Qwen installer installs both the GPU-targeted ROCm runtime and the matching
 ROCm core development package. The latter supplies HIP's CMake package, which
 is required to build llama.cpp; installing only the runtime package is
 insufficient.
+
+## Windows access to the ComfyUI workspace
+
+The server role of `setup-comfyui.sh` exposes the shared store at
+`\\<controller>\comfyui`. Open that path in Windows Explorer to copy files
+directly into these folders:
+
+| Folder | Purpose |
+| --- | --- |
+| `models` | Checkpoints, LoRAs, VAEs, ControlNet models, and other model types |
+| `custom_nodes` | Custom-node source shared by both ComfyUI workers |
+| `workflows` | Workflows used by both ComfyUI nodes |
+| `input` | Source images and other workflow inputs |
+| `output` | Generated images and other workflow outputs |
+
+Only the controller exports this SMB share. The peer sees the same changes
+through the private NFS mount. Both ComfyUI checkouts link their
+`custom_nodes` directories to the shared folder. Virtual environments,
+installed Python packages, user data, Manager configuration, and temporary
+files remain local to each worker. The shared Hugging Face cache and cluster
+metadata are hidden from SMB clients.
+
+The share name can be changed with `--smb-share-name <name>`, or omitted with
+`--no-smb-share`. Rerun the server-side ComfyUI setup command to add the share
+to an existing installation. Because access is anonymous and read/write, any
+client on an allowed LAN can replace or delete assets.
+
+> [!WARNING]
+> Files below `custom_nodes` are executable Python code. A client that can
+> write to this anonymous share can execute code as the ComfyUI service account
+> when either worker loads or reloads custom nodes. Allow TCP port `445` only
+> from a fully trusted LAN, never forward the share through a router, and do
+> not use this configuration on an untrusted network.
+
+The installer assigns all exposed workspace folders to the shared `aimodels`
+group, adds group write access recursively, and installs inherited default
+ACLs so nested model and custom-node directories created later remain writable
+over SMB. It runs nested read/write/delete tests through SMB in every exposed
+folder and directly through the shared filesystem on both nodes. Setup stops
+if any mapped folder fails these checks. Rerun the updated server-side
+installer if an older installation exposes writable top-level folders but
+read-only subdirectories.
+
+### Remote custom-node setup
+
+Custom-node source can be copied or extracted into
+`\\<controller>\comfyui\custom_nodes\<node-name>` from Windows. To finish a
+node installation without SSH:
+
+1. Open ComfyUI Manager on the controller and install or repair the custom
+   node's dependencies in that worker's local virtual environment.
+2. Repeat the dependency install or repair in ComfyUI Manager on the peer.
+3. Use **Restart both ComfyUI workers** in the cluster dashboard. If the
+   dashboard is not installed, restart each worker from its Manager interface.
+4. Import the workflow and confirm that neither worker reports missing nodes
+   or import failures.
+
+The source tree is shared, but Python dependencies and loaded process state
+are not. A custom node is cluster-ready only after it loads successfully on
+both workers.
+
+When converting existing installations, rerun `setup-comfyui.sh` on the
+controller first and the peer second. The controller's copy is canonical. The
+peer copies only custom-node entries that are missing from the shared tree and
+preserves its original directory as
+`custom_nodes.local-before-sharing-<timestamp>` for manual comparison. It does
+not overwrite an existing shared Git repository.
 
 ## Windows file transfer through XRDP
 

@@ -19,9 +19,21 @@ FULL_CAPACITY_CONFIRMATION = (
     "workloads. Warmup requests are excluded from the median. Continue?"
 )
 SERVER_RESTART_UNIT = "qwen3d8-server-restart.service"
+COMFYUI_RESTART_UNIT = "qwen3d8-comfyui-restart.service"
 SERVER_RESTART_CONFIRMATION = (
     "Restart the controller Qwen server? Active inference requests will be "
     "interrupted, and model loading may take several minutes."
+)
+COMFYUI_CONTROLLER_RESTART_CONFIRMATION = (
+    "Restart controller ComfyUI? Active workflows on the controller will be "
+    "interrupted."
+)
+COMFYUI_PEER_RESTART_CONFIRMATION = (
+    "Restart peer ComfyUI? Active workflows on the peer will be interrupted."
+)
+COMFYUI_BOTH_RESTART_CONFIRMATION = (
+    "Restart both ComfyUI workers? Every active ComfyUI workflow will be "
+    "interrupted."
 )
 
 try:
@@ -30,7 +42,9 @@ try:
         format_bytes,
         format_fans,
         format_temperature,
+        http_post_json,
         load_config,
+        read_token,
     )
     from .token_metrics import TokenRateStore
     from .cluster_tests import (
@@ -48,7 +62,9 @@ except ImportError:
         format_bytes,
         format_fans,
         format_temperature,
+        http_post_json,
         load_config,
+        read_token,
     )
     from token_metrics import TokenRateStore
     from cluster_tests import (
@@ -645,6 +661,96 @@ class DashboardApp:
             "The dashboard will report readiness after model loading completes."
         )
 
+    @staticmethod
+    def _restart_local_comfyui() -> tuple[bool, str]:
+        try:
+            completed = subprocess.run(
+                ["systemctl", "start", COMFYUI_RESTART_UNIT],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"controller: {exc}"
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            fallback = f"systemctl exited {completed.returncode}"
+            return False, f"controller: {detail[:500] or fallback}"
+        return True, "controller: restart requested"
+
+    def _restart_peer_comfyui(self) -> tuple[bool, str]:
+        agent_url = str(self.config.get("peer_agent_url", "")).rstrip("/")
+        if not agent_url:
+            return False, "peer: peer_agent_url is not configured"
+
+        headers: dict[str, str] = {}
+        token = read_token(self.config.get("peer_agent_token_file"))
+        if token:
+            headers["X-Cluster-Agent-Token"] = token
+        status, body = http_post_json(
+            f"{agent_url}/actions/restart-comfyui",
+            {},
+            timeout=30,
+            headers=headers,
+        )
+        if status not in {200, 202}:
+            if isinstance(body, dict):
+                detail = body.get("error") or body.get("message") or body
+            else:
+                detail = body
+            return False, f"peer: HTTP {status}: {detail}"
+        if not isinstance(body, dict) or body.get("status") not in {
+            "accepted",
+            "ok",
+        }:
+            return False, f"peer: invalid agent response: {body}"
+        return True, "peer: restart requested"
+
+    def restart_comfyui(
+        self, target: str
+    ) -> tuple[str, str, str, str, str]:
+        """Request a controlled ComfyUI restart on one or both nodes."""
+
+        normalized_target = target.strip().lower()
+        if normalized_target not in {"controller", "peer", "both"}:
+            message = f"[FAIL] Unknown ComfyUI restart target: {target}"
+            self._log_error(message)
+            return self._action_response(message)
+        if str(self.config.get("role", "")).lower() != "server":
+            message = (
+                "[FAIL] ComfyUI restart controls are available only on the "
+                "controller dashboard."
+            )
+            self._log_error(message)
+            return self._action_response(message)
+
+        with self._test_lock:
+            if self._active_test:
+                message = (
+                    f"[FAIL] Cannot restart ComfyUI while "
+                    f"{self._active_test} is running. Cancel it first."
+                )
+                self._log_error(message)
+                return self._action_response(message)
+            self._active_test = f"ComfyUI {normalized_target} restart"
+            try:
+                results: list[tuple[bool, str]] = []
+                if normalized_target in {"peer", "both"}:
+                    results.append(self._restart_peer_comfyui())
+                if normalized_target in {"controller", "both"}:
+                    results.append(self._restart_local_comfyui())
+            finally:
+                self._active_test = ""
+
+        details = "; ".join(detail for _, detail in results)
+        if not all(ok for ok, _ in results):
+            message = f"[FAIL] ComfyUI restart request incomplete: {details}"
+            self._log_error(message)
+            return self._action_response(message)
+        return self._action_response(f"[PASS] ComfyUI {details}.")
+
     def request_cancel(self) -> str:
         with self._test_lock:
             active_test = self._active_test
@@ -847,6 +953,15 @@ def build_demo(app: DashboardApp) -> Any:
     def restart_server():
         return app.restart_server()
 
+    def restart_controller_comfyui():
+        return app.restart_comfyui("controller")
+
+    def restart_peer_comfyui():
+        return app.restart_comfyui("peer")
+
+    def restart_both_comfyui():
+        return app.restart_comfyui("both")
+
     with gr.Blocks(title="Strix Halo Cluster Dashboard") as demo:
         gr.Markdown("# Strix Halo Cluster Dashboard")
         gr.Markdown(render_installed_configuration(app.config))
@@ -860,6 +975,30 @@ def build_demo(app: DashboardApp) -> Any:
             interactive=False,
         )
 
+        restart_button = None
+        restart_controller_comfyui_button = None
+        restart_peer_comfyui_button = None
+        restart_both_comfyui_button = None
+        if str(app.config.get("role", "")).lower() == "server":
+            gr.Markdown("## Service controls")
+            gr.Markdown(
+                "Restart services after changing models, custom nodes, or "
+                "workflows. Active requests on the selected service stop."
+            )
+            with gr.Row():
+                restart_button = gr.Button(
+                    "Restart Qwen server", variant="stop"
+                )
+                restart_controller_comfyui_button = gr.Button(
+                    "Restart controller ComfyUI", variant="stop"
+                )
+                restart_peer_comfyui_button = gr.Button(
+                    "Restart peer ComfyUI", variant="stop"
+                )
+                restart_both_comfyui_button = gr.Button(
+                    "Restart both ComfyUI workers", variant="stop"
+                )
+
         gr.Markdown("## On-demand verification")
         gr.Markdown(
             "Run diagnostics when no production workload is active."
@@ -867,11 +1006,6 @@ def build_demo(app: DashboardApp) -> Any:
 
         with gr.Row():
             refresh_button = gr.Button("Refresh status")
-            restart_button = None
-            if str(app.config.get("role", "")).lower() == "server":
-                restart_button = gr.Button(
-                    "Restart Qwen server", variant="stop"
-                )
             configuration_button = gr.Button("Verify configuration")
             runtime_button = gr.Button("Runtime health and slots")
             usb4_button = gr.Button("Test USB4 throughput")
@@ -949,6 +1083,33 @@ def build_demo(app: DashboardApp) -> Any:
                 restart_server,
                 outputs=[output, status, token_history, error_log, details],
                 js=f"() => window.confirm({json.dumps(SERVER_RESTART_CONFIRMATION)})",
+            )
+        if restart_controller_comfyui_button is not None:
+            restart_controller_comfyui_button.click(
+                restart_controller_comfyui,
+                outputs=[output, status, token_history, error_log, details],
+                js=(
+                    "() => window.confirm("
+                    f"{json.dumps(COMFYUI_CONTROLLER_RESTART_CONFIRMATION)})"
+                ),
+            )
+        if restart_peer_comfyui_button is not None:
+            restart_peer_comfyui_button.click(
+                restart_peer_comfyui,
+                outputs=[output, status, token_history, error_log, details],
+                js=(
+                    "() => window.confirm("
+                    f"{json.dumps(COMFYUI_PEER_RESTART_CONFIRMATION)})"
+                ),
+            )
+        if restart_both_comfyui_button is not None:
+            restart_both_comfyui_button.click(
+                restart_both_comfyui,
+                outputs=[output, status, token_history, error_log, details],
+                js=(
+                    "() => window.confirm("
+                    f"{json.dumps(COMFYUI_BOTH_RESTART_CONFIRMATION)})"
+                ),
             )
         capacity_event = capacity_button.click(
             run_capacity_with_progress,

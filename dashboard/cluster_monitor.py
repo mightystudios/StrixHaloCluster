@@ -340,6 +340,8 @@ def http_json(
             raw = exc.read()
         except OSError:
             raw = b""
+        finally:
+            exc.close()
         try:
             body: Any = json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -380,6 +382,8 @@ def http_post_json(
             raw = exc.read()
         except OSError:
             raw = b""
+        finally:
+            exc.close()
         try:
             response_body: Any = json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError):

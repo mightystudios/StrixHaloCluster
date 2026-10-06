@@ -21,6 +21,8 @@ VENV="${VENV:-$APP_ROOT/venv}"
 METRICS_DB="${METRICS_DB:-/var/lib/$SERVICE_USER/token-rates.sqlite3}"
 SERVER_RESTART_UNIT="${SERVER_RESTART_UNIT:-qwen3d8-server-restart.service}"
 SERVER_RESTART_POLKIT_RULE="${SERVER_RESTART_POLKIT_RULE:-/etc/polkit-1/rules.d/49-qwen3d8-dashboard-restart.rules}"
+COMFYUI_RESTART_UNIT="${COMFYUI_RESTART_UNIT:-qwen3d8-comfyui-restart.service}"
+COMFYUI_RESTART_POLKIT_RULE="${COMFYUI_RESTART_POLKIT_RULE:-/etc/polkit-1/rules.d/49-qwen3d8-dashboard-comfyui-restart.rules}"
 
 CLUSTER_ENV="${CLUSTER_ENV:-/etc/qwen3d8/cluster.env}"
 USB4_ENV="${USB4_ENV:-/etc/default/usb4-cluster}"
@@ -59,8 +61,8 @@ Usage:
   sudo bash $SCRIPT_NAME --role <server|peer> [options]
 
 Installs the dashboard tools independently from the main cluster installers.
-Both roles receive the private read-only telemetry agent. The server role also
-receives the Gradio dashboard and on-demand test runner.
+Both roles receive the private telemetry and controlled-action agent. The
+server role also receives the Gradio dashboard and on-demand test runner.
 
 Options:
   --role <server|peer>       Controller dashboard or worker telemetry agent
@@ -369,7 +371,7 @@ chmod 0644 "$CONFIG_FILE"
 
 cat > /etc/systemd/system/qwen3d8-node-agent.service <<UNIT
 [Unit]
-Description=Strix Halo cluster read-only node telemetry agent
+Description=Strix Halo cluster private telemetry and control agent
 After=network-online.target
 Wants=network-online.target
 
@@ -393,6 +395,30 @@ LimitNOFILE=4096
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+cat > "/etc/systemd/system/$COMFYUI_RESTART_UNIT" <<UNIT
+[Unit]
+Description=Controlled ComfyUI restart requested by the cluster dashboard
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart comfyui.service
+UNIT
+
+install -d -m 0755 /etc/polkit-1/rules.d
+cat > "$COMFYUI_RESTART_POLKIT_RULE" <<POLKIT
+// Managed by $SCRIPT_NAME. Allow only the dashboard service account to start
+// the dedicated helper; the helper performs the privileged ComfyUI restart.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "$COMFYUI_RESTART_UNIT" &&
+        action.lookup("verb") == "start" &&
+        subject.user == "$SERVICE_USER") {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+chmod 0644 "$COMFYUI_RESTART_POLKIT_RULE"
 
 if [ "$NODE_ROLE" = "server" ]; then
   cat > /etc/systemd/system/qwen3d8-dashboard.service <<UNIT
@@ -432,7 +458,6 @@ Type=oneshot
 ExecStart=/usr/bin/systemctl restart qwen3d8-server.service
 UNIT
 
-  install -d -m 0755 /etc/polkit-1/rules.d
   cat > "$SERVER_RESTART_POLKIT_RULE" <<POLKIT
 // Managed by $SCRIPT_NAME. Allow only the dashboard service to start the
 // dedicated helper; the helper performs the privileged Qwen restart.
@@ -488,3 +513,4 @@ if [ "$NODE_ROLE" = "server" ]; then
   echo "  service:       qwen3d8-dashboard.service"
 fi
 echo "  agent service:  qwen3d8-node-agent.service"
+echo "  ComfyUI helper: $COMFYUI_RESTART_UNIT"
