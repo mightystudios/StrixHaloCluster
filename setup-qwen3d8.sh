@@ -59,7 +59,7 @@ LLAMA_PORT="${LLAMA_PORT:-8081}"
 WEBUI_HOST_PORT="${WEBUI_HOST_PORT:-3000}"
 NGINX_PORT="${NGINX_PORT:-80}"
 
-PARALLEL_SLOTS="${PARALLEL_SLOTS:-3}"
+PARALLEL_SLOTS="${PARALLEL_SLOTS:-2}"
 CONTEXT_K="${CONTEXT_K:-}"
 LEGACY_CONTEXT_PER_SLOT="${CONTEXT_PER_SLOT:-}"
 CONTEXT_PER_SLOT=""
@@ -72,6 +72,7 @@ YARN_MODEL_CONTEXT_OVERRIDE=""
 YARN_SERVER_ARGS=""
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-f16}"
 TENSOR_SPLIT="${TENSOR_SPLIT:-}"
+Q4_TWO_SLOT_BALANCE="24,76"
 HOST_BUFFER_ESTIMATE_GIB="${HOST_BUFFER_ESTIMATE_GIB:-60}"
 MIN_HEADROOM_GIB="${MIN_HEADROOM_GIB:-8}"
 KV_MEMORY_ESTIMATE_GIB=""
@@ -140,7 +141,9 @@ The same script is used on both nodes so ROCm and llama.cpp remain identical.
 Options:
   --role <server|peer>       Controller/API node or RPC worker
   --quant <Q4|Q5|Q6>        Model quantization (default: Q4)
-  --balance <a,b>            Controller,peer ratio (default: computed per quant)
+  --parallel <slots>         Concurrent Qwen inference slots (default: $PARALLEL_SLOTS)
+  --balance <a,b>            Controller,peer ratio (default: Q4 with two slots
+                             uses $Q4_TWO_SLOT_BALANCE; other profiles are computed)
   --context <K>              Context per slot in Ki-tokens; 256 = 262,144 tokens
                              (default: 192 = 196,608 tokens; Q4 maximum: 512)
                              Q4 contexts above 256 use YaRN automatically;
@@ -164,8 +167,8 @@ Options:
 Planning values:
   Q4 = 110 GiB, Q5 = 150 GiB, Q6 = 160 GiB.
   Controller-only Gated DeltaNet host buffer allowance = 60 GiB.
-  The automatic balance ratio equalizes estimated node use while preserving
-  slightly more headroom on the controller.
+  The Q4 two-slot profile uses balance $Q4_TWO_SLOT_BALANCE to reserve controller
+  headroom for ComfyUI. Other profiles compute a balance from estimated use.
 
 Known upstream-tracker report:
   A non-maintainer user reported that Qwen3.8 Q5/Q6 RPC on two gfx1151 nodes
@@ -189,6 +192,11 @@ while [ "$#" -gt 0 ]; do
     --quant)
       need_arg "$1" "${2:-}"
       QUANT="$2"
+      shift
+      ;;
+    --parallel)
+      need_arg "$1" "${2:-}"
+      PARALLEL_SLOTS="$2"
       shift
       ;;
     --balance|--tensor-split)
@@ -346,21 +354,25 @@ compute_memory_plan() {
   TOTAL_DISTRIBUTED_ESTIMATE_GIB=$((MODEL_MEMORY_ESTIMATE_GIB + KV_MEMORY_ESTIMATE_GIB))
 
   if [ -z "$TENSOR_SPLIT" ]; then
-    local controller_ratio
-    local peer_ratio
-    controller_ratio="$(
-      awk \
-        -v distributed="$TOTAL_DISTRIBUTED_ESTIMATE_GIB" \
-        -v host="$HOST_BUFFER_ESTIMATE_GIB" \
-        'BEGIN {
-          ratio = int(((distributed - host) / (2 * distributed)) * 100);
-          if (ratio < 1) ratio = 1;
-          if (ratio > 49) ratio = 49;
-          print ratio;
-        }'
-    )"
-    peer_ratio=$((100 - controller_ratio))
-    TENSOR_SPLIT="$controller_ratio,$peer_ratio"
+    if [ "$QUANT" = "Q4" ] && [ "$PARALLEL_SLOTS" -eq 2 ]; then
+      TENSOR_SPLIT="$Q4_TWO_SLOT_BALANCE"
+    else
+      local controller_ratio
+      local peer_ratio
+      controller_ratio="$(
+        awk \
+          -v distributed="$TOTAL_DISTRIBUTED_ESTIMATE_GIB" \
+          -v host="$HOST_BUFFER_ESTIMATE_GIB" \
+          'BEGIN {
+            ratio = int(((distributed - host) / (2 * distributed)) * 100);
+            if (ratio < 1) ratio = 1;
+            if (ratio > 49) ratio = 49;
+            print ratio;
+          }'
+      )"
+      peer_ratio=$((100 - controller_ratio))
+      TENSOR_SPLIT="$controller_ratio,$peer_ratio"
+    fi
   fi
 
   local controller_ratio
@@ -434,7 +446,10 @@ if [ -n "$RPC_CACHE_MIN_GIB" ]; then
 fi
 [[ "$RPC_PORT" =~ ^[0-9]+$ ]] || die "RPC_PORT must be numeric"
 [[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] || die "LLAMA_PORT must be numeric"
-[[ "$PARALLEL_SLOTS" =~ ^[0-9]+$ ]] || die "PARALLEL_SLOTS must be numeric"
+[[ "$PARALLEL_SLOTS" =~ ^[0-9]+$ ]] \
+  && [ "$PARALLEL_SLOTS" -ge 1 ] \
+  && [ "$PARALLEL_SLOTS" -le 32 ] \
+  || die "--parallel must be between 1 and 32"
 if [ -z "$CONTEXT_K" ]; then
   if [ -n "$LEGACY_CONTEXT_PER_SLOT" ]; then
     [[ "$LEGACY_CONTEXT_PER_SLOT" =~ ^[0-9]+$ ]] \
@@ -519,6 +534,7 @@ fi
 
 log "Selected Qwen3.8 configuration"
 echo "  quant:                    $QUANT ($MODEL_QUANT)"
+echo "  parallel slots:           $PARALLEL_SLOTS"
 echo "  context per slot:         ${CONTEXT_K} Ki ($CONTEXT_PER_SLOT tokens)"
 if [ "$CONTEXT_SCALING" = "yarn" ]; then
   echo "  context scaling:          YaRN ${YARN_ROPE_SCALE}x from ${NATIVE_CONTEXT_PER_SLOT} tokens"
@@ -1326,6 +1342,7 @@ echo
 echo "${GRN}${BOLD}Qwen3.8 $QUANT installation complete on $(hostname -s)${RST}"
 echo "  role:          $NODE_ROLE"
 echo "  quant:         $MODEL_QUANT"
+echo "  slots:         $PARALLEL_SLOTS"
 echo "  balance:       $TENSOR_SPLIT (controller,peer)"
 echo "  context:       ${CONTEXT_K} Ki per slot ($CONTEXT_PER_SLOT tokens; $CONTEXT_SCALING)"
 if [ "$CONTEXT_SCALING" = "yarn" ]; then

@@ -4,6 +4,10 @@ This directory holds small, source patches applied to the pinned `llama.cpp`
 checkout during `setup-qwen3d8.sh`'s build step. Patches are applied
 automatically; nothing here needs to be run by hand.
 
+ComfyUI patches are kept in [`patches/comfyui/`](comfyui/) so the
+`setup-qwen3d8.sh` root-level `patches/*.patch` loop cannot apply them to
+`llama.cpp`.
+
 ## `llama-cpp-427291b-salvage-final-chat-parse.patch`
 
 Targets commit `427291b5b34cd914a31b3fd3b61a68f6184f4b9f` (the commit pinned

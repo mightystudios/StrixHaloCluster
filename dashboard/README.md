@@ -10,10 +10,10 @@ those components.
 Run the installer on the controller and worker after the normal cluster setup:
 
 ```bash
-# For three extended 512 Ki Q4 slots, configure Qwen3.8 first:
+# For two extended 512 Ki Q4 slots with controller ComfyUI headroom:
 # setup-qwen3d8.sh enables 2x YaRN automatically above the native 256 Ki limit.
-sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --context 512 --skip-foundation
-sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --context 512 --skip-foundation
+sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 512 --skip-foundation
+sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 512 --skip-foundation
 
 # Controller
 sudo bash dashboard/setup-dashboard.sh \
@@ -46,12 +46,17 @@ Restarting interrupts active inference requests, and the dashboard remains
 degraded until the model finishes loading.
 
 The dashboard also includes **Restart controller ComfyUI**, **Restart peer
-ComfyUI**, and **Restart both ComfyUI workers** controls. Each node has a
+ComfyUI**, and **Start/restart both ComfyUI instances** controls. Each node has a
 root-owned ComfyUI helper and a polkit rule that permits the dashboard service
 account to start only that helper. The combined action attempts both nodes
 even if one restart fails and reports each result. Restarting ComfyUI
 interrupts active workflows on the selected node, so use these controls only
 after current jobs finish.
+
+The default workload profile keeps peer ComfyUI disabled at boot. The peer
+restart control starts that standby service for the current boot and reduces
+the memory available to Qwen RPC. Use controller ComfyUI for concurrent
+two-user Qwen operation; activate peer ComfyUI only when Qwen is idle.
 
 The worker agent listens only on the private cluster address. The dashboard
 defaults to port `7860`; the agent defaults to port `8765`. UFW rules are

@@ -30,7 +30,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rpc_port": 50053,
     "iperf_port": 5201,
     "cluster_iface": "usb4llm0",
-    "parallel_slots": 3,
+    "parallel_slots": 2,
     "context_per_slot": 262144,
     "native_context_per_slot": 262144,
     "context_scaling": "native",
@@ -186,7 +186,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config["agent_port"] = _as_int(config.get("agent_port"), 8765)
     config["rpc_port"] = _as_int(config.get("rpc_port"), 50053)
     config["iperf_port"] = _as_int(config.get("iperf_port"), 5201)
-    config["parallel_slots"] = _as_int(config.get("parallel_slots"), 3)
+    config["parallel_slots"] = _as_int(config.get("parallel_slots"), 2)
     config["context_per_slot"] = _as_int(
         config.get("context_per_slot"), 262144
     )

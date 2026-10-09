@@ -1,0 +1,57 @@
+diff --git a/comfy/ldm/hunyuan3d/vae.py b/comfy/ldm/hunyuan3d/vae.py
+index 76094482..43d2d5ca 100644
+--- a/comfy/ldm/hunyuan3d/vae.py
++++ b/comfy/ldm/hunyuan3d/vae.py
+@@ -1,9 +1,12 @@
+ # Original: https://github.com/Tencent/Hunyuan3D-2/blob/main/hy3dgen/shapegen/models/autoencoders/model.py
+ # Since the header on their VAE source file was a bit confusing we asked for permission to use this code from tencent under the GPL license used in ComfyUI.
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++from torch.nn.attention import SDPBackend, sdpa_kernel
+ import numpy as np
+ import math
+ from tqdm import tqdm
+@@ -15,6 +18,21 @@ import logging
+ import comfy.ops
+ ops = comfy.ops.disable_weight_init
+ 
++_force_math_sdpa = os.getenv("COMFY_HY3D_FORCE_MATH_SDPA") == "1"
++if _force_math_sdpa and torch.version.hip is not None:
++    logging.warning(
++        "Hunyuan3D VAE is using Math SDPA because fused ROCm attention "
++        "failed its compatibility probe."
++    )
++
++
++def _hunyuan3d_scaled_dot_product_attention(q, k, v):
++    if _force_math_sdpa and torch.version.hip is not None:
++        with sdpa_kernel(SDPBackend.MATH):
++            return F.scaled_dot_product_attention(q, k, v)
++    return F.scaled_dot_product_attention(q, k, v)
++
++
+ def fps(src: torch.Tensor, batch: torch.Tensor, sampling_ratio: float, start_random: bool = True):
+ 
+     # manually create the pointer vector
+@@ -637,7 +655,7 @@ class QKVMultiheadCrossAttention(nn.Module):
+         k = self.k_norm(k)
+ 
+         q, k, v = [t.permute(0, 2, 1, 3) for t in (q, k, v)]
+-        out = F.scaled_dot_product_attention(q, k, v)
++        out = _hunyuan3d_scaled_dot_product_attention(q, k, v)
+ 
+         out = out.transpose(1, 2).reshape(bs, n_ctx, -1)
+ 
+@@ -744,7 +762,7 @@ class QKVMultiheadAttention(nn.Module):
+         k = self.k_norm(k)
+ 
+         q, k, v = [t.permute(0, 2, 1, 3) for t in (q, k, v)]
+-        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(bs, n_ctx, -1)
++        out = _hunyuan3d_scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(bs, n_ctx, -1)
+         return out
+ 
+ 

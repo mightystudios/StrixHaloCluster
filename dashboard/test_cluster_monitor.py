@@ -677,7 +677,7 @@ class CapacityTimeoutTests(unittest.TestCase):
             parallel_slots=3,
         )
 
-        self.assertEqual(timeout, 14400)
+        self.assertEqual(timeout, 21600)
 
     def test_explicit_timeout_overrides_automatic_timeout(self) -> None:
         timeout = cluster_tests._capacity_timeout(
@@ -754,6 +754,17 @@ class CapacityTimeoutTests(unittest.TestCase):
 
 
 class DashboardConfigurationTests(unittest.TestCase):
+    def test_defaults_to_two_installed_parallel_slots(self) -> None:
+        with patch.object(
+            cluster_monitor,
+            "parse_env_file",
+            side_effect=[{}, {}],
+        ):
+            config = cluster_monitor.load_config()
+
+        self.assertEqual(config["parallel_slots"], 2)
+        self.assertEqual(config["expected_parallel_slots"], 2)
+
     def test_preserves_smaller_timing_defaults_over_installed_capacity(self) -> None:
         cluster_environment = {
             "NODE_ROLE": "server",

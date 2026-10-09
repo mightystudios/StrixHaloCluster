@@ -2,14 +2,15 @@
 
 Yet another setup process for a two-PC AMD Strix Halo cluster.
 
-This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over USB4 as a private AI cluster hosting Qwen3.8-Flash-Next for up to three concurrent inference slots. ComfyUI and a system monitoring dashboard can also be installed.
+This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over USB4 as a private AI cluster. The default workload profile hosts Qwen3.8-Flash-Next for two concurrent inference users while reserving controller headroom for one ComfyUI user. A system monitoring dashboard can also be installed.
 
 ## Features
 
 - Turnkey scripts. Start with a fresh Ubuntu install and the scripts handle all the rest.
 - The tested Bosgame M5 nodes are linked over USB4. The verifier targets at least 8 Gbit/s over the private link. A USB4 data cable is required. I use https://link.amazon/B03prmZHS
-- Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. To host up to three concurrent inference sessions, I use Q4 with 512 Ki tokens per slot.
-- ComfyUI is set up on both nodes. Each node runs its own ComfyUI instance, and both use a shared workspace for models, custom-node source, workflows, inputs, and outputs.
+- Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. The default Q4 profile uses two slots and a `24,76` controller-to-worker tensor split to reserve more controller memory for ComfyUI.
+- ComfyUI is installed on both nodes with a shared workspace for models, custom-node source, workflows, inputs, and outputs. The controller service is active by default; the peer service is installed in standby to protect the Qwen RPC worker.
+- Native Hunyuan3D workflows use an automatically selected, ComfyUI-only SDPA compatibility policy for the Radeon 8060S. The installer prefers default attention when it passes an exact-shape GPU probe and otherwise enables the verified Math SDPA fallback.
 - The controller exposes the shared ComfyUI workspace as an anonymous, read/write `comfyui` share so Windows clients can manage models, custom-node source, workflows, inputs, and outputs without SSH.
 - Both nodes provide remote desktop services and each exposes an anonymous, read/write `xfer` folder on the network for maintenance from Windows clients.
 - Qwen3.8-Flash-Next sessions served by the cluster have been tested from Windows clients using Open WebUI in a web browser, [AnythingLLM](https://anythingllm.com/) on the desktop, VS Code [extensions](https://marketplace.visualstudio.com/items?itemName=AndrewButson.github-copilot-llm-gateway), and custom tools using the Copilot SDK.
@@ -26,6 +27,9 @@ The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very litt
 
 
 ### Benchmark
+
+This is an earlier three-slot throughput reference, not the current two-Qwen-
+user plus one-ComfyUI-user default:
 
 - QWEN3.8-Flash-Next Q4_K_XL 512Ki context window, 3 parallel user slots:
     - 382.1 tok/s prompt rate, 15.9 tok/s generation
@@ -58,13 +62,42 @@ The controller serves the LAN API and coordinates inference; the worker provides
 ```mermaid
 graph LR
     clients["LAN clients"] --> comfy_a["Controller ComfyUI<br/>:8188"]
-    clients --> comfy_b["Worker ComfyUI<br/>:8188"]
+    comfy_b["Worker ComfyUI<br/>standby by default"]
     windows["Windows clients"] -->|SMB :445| store
     comfy_a -->|local| store["Shared ComfyUI workspace<br/>/srv/comfyui :2049"]
-    comfy_b -->|NFS over USB4| store
+    comfy_b -->|NFS over USB4 when active| store
 ```
 
-Both nodes run ComfyUI. The controller owns the shared workspace, exports it to the worker over the private link, and exposes its managed folders to Windows over SMB. XRDP and the per-node `xfer` shares are omitted from this focused diagram.
+Both nodes have ComfyUI installed, but only the controller starts it by default.
+The controller owns the shared workspace, exports it to the worker over the
+private link, and exposes its managed folders to Windows over SMB. The peer
+instance can be activated when Qwen is idle. XRDP and the per-node `xfer`
+shares are omitted from this focused diagram.
+
+### Hunyuan3D compatibility
+
+ComfyUI `v0.39.0` directly invokes PyTorch scaled dot-product attention in two
+native Hunyuan3D VAE paths. On the tested Radeon 8060S (`gfx1151`) stack with
+PyTorch `2.11.0+rocm10.0.0`, the default, Flash, and Efficient SDPA backends
+fail with `hipErrorInvalidValue`. Math SDPA passes the same float16
+`[1,16,4096,64]` self-attention layout, the decoder's
+`[1,16,8000,64]`-by-`[1,16,4096,64]` cross-attention layout, and the full
+`VAEDecodeHunyuan3D` path.
+
+`setup-comfyui.sh` pins the tested ComfyUI revision, applies a small managed
+patch to both direct Hunyuan3D attention calls, and runs each GPU backend test
+in a fresh process. Its default `--hy3d-sdpa auto` mode uses default SDPA when
+it passes and otherwise sets `COMFY_HY3D_FORCE_MATH_SDPA=1` only in
+`comfyui.service`. Rerunning the installer after a future PyTorch upgrade
+automatically retires the fallback once default SDPA passes. Use
+`--hy3d-sdpa default` to require the default backend or `--hy3d-sdpa math` to
+require the fallback.
+
+The Math backend is slower; the diagnostic 4096-latent VAE decode took about
+246 seconds. The patch does not alter system ROCm, `llama.cpp`, or either Qwen
+unit. The installer records the active Qwen unit's PID before provisioning and
+fails if that service stops or restarts. It also refuses to replace unrelated
+tracked edits in the local ComfyUI checkout.
 
 ## Requirements
 
@@ -94,13 +127,13 @@ sudo bash setup-environment.sh --role peer --user <linux-user>    # peer
 sudo bash verify-environment.sh  # server
 sudo bash verify-environment.sh  # peer
 
-# 3. Distributed Qwen3.8: run on the server first, then the peer using the proper --role settings for each
-sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --context 256 --skip-foundation # server
-sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --context 256 --skip-foundation   # peer
+# 3. Distributed Qwen3.8: two slots with controller headroom for ComfyUI
+sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 256 --skip-foundation # server
+sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 256 --skip-foundation   # peer
 
-# 4. Optional ComfyUI: run on the server first, then the peer using the proper --role settings for each
-sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role server --user <linux-user>    # server
-sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role peer --user <linux-user>      # peer
+# 4. Optional ComfyUI: active on the controller, installed in standby on the peer
+sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role server --service-mode active --user <linux-user>   # server
+sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role peer --service-mode standby --user <linux-user>   # peer
 
 # 5. Optional dashboard: run on the server first, then the peer using the proper --role settings for each
 sudo bash dashboard/setup-dashboard.sh --role server --dashboard-host 0.0.0.0   # server
@@ -109,18 +142,20 @@ sudo bash dashboard/setup-dashboard.sh --role peer  # peer
 
 The controller downloads the model and serves the API; the worker provides the USB4 RPC service. If you skip the preliminary environment step, omit `--skip-foundation` from `setup-qwen3d8.sh` and let that script run it.
 
-For three Q4 slots with an extended 512 Ki-token-per-slot context, replace
-`--context 256` with `--context 512` in both Qwen setup commands. The
-installer automatically configures 2x YaRN scaling and the required temporary
-GGUF metadata override; run the capacity test and long-context quality checks
-before using the extended window in production.
+For two Q4 slots with an extended 512 Ki-token-per-slot context, replace
+`--context 256` with `--context 512` in both Qwen setup commands. Keep
+`--balance 24,76` to reserve controller headroom for ComfyUI. The installer
+automatically configures 2x YaRN scaling and the required temporary GGUF
+metadata override; run the two-user capacity test and a representative
+controller ComfyUI workflow together before using the extended window in
+production.
 
 ## Scripts
 
 | Script | Purpose |
 | --- | --- |
 | `setup-environment.sh` | Base node setup: USB4, Samba file drop, XRDP, SSH, and UFW |
-| `setup-comfyui.sh` | ComfyUI on each node with an NFS-shared workspace and controller-side Windows share |
+| `setup-comfyui.sh` | Pinned controller-active and peer-standby ComfyUI, automatic Hunyuan3D SDPA compatibility selection, an NFS-shared workspace, and a controller-side Windows share |
 | `setup-qwen3d8.sh` | ROCm, `llama.cpp`, Qwen3.8 model, RPC services, and controller web UI |
 | `verify-environment.sh` | Checks services, networking, firewall rules, and USB4 throughput |
 | `dashboard/` | Independent telemetry agent, Python test runner, Gradio dashboard, and dashboard-only installer |
@@ -129,10 +164,10 @@ before using the extended window in production.
 
 - USB4: `usb4llm0`, controller `10.200.0.1`, worker `10.200.0.2`
 - RPC worker: private TCP port `50053`
-- Qwen3.8: Q4, three parallel inference slots, 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki tokens per slot, or `--context 512` for Q4 with automatic 2x YaRN scaling
+- Qwen3.8: Q4, two parallel inference slots, `24,76` controller-to-worker balance, and 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki tokens per slot, or `--context 512` for Q4 with automatic 2x YaRN scaling
 - Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1/`
 - Cluster dashboard: `http://<controller>:7860` after installing `dashboard/setup-dashboard.sh`
-- ComfyUI: `http://<node>:8188`
+- ComfyUI: controller at `http://<controller>:8188`; peer installed in standby
 - Windows ComfyUI workspace: `\\<controller>\comfyui`
 - Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
 - XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
@@ -161,8 +196,8 @@ directly into these folders:
 | Folder | Purpose |
 | --- | --- |
 | `models` | Checkpoints, LoRAs, VAEs, ControlNet models, and other model types |
-| `custom_nodes` | Custom-node source shared by both ComfyUI workers |
-| `workflows` | Workflows used by both ComfyUI nodes |
+| `custom_nodes` | Custom-node source shared by both ComfyUI checkouts |
+| `workflows` | Workflows available to both ComfyUI instances |
 | `input` | Source images and other workflow inputs |
 | `output` | Generated images and other workflow outputs |
 
@@ -181,7 +216,7 @@ client on an allowed LAN can replace or delete assets.
 > [!WARNING]
 > Files below `custom_nodes` are executable Python code. A client that can
 > write to this anonymous share can execute code as the ComfyUI service account
-> when either worker loads or reloads custom nodes. Allow TCP port `445` only
+> when either instance loads or reloads custom nodes. Allow TCP port `445` only
 > from a fully trusted LAN, never forward the share through a router, and do
 > not use this configuration on an untrusted network.
 
@@ -201,16 +236,16 @@ Custom-node source can be copied or extracted into
 node installation without SSH:
 
 1. Open ComfyUI Manager on the controller and install or repair the custom
-   node's dependencies in that worker's local virtual environment.
-2. Repeat the dependency install or repair in ComfyUI Manager on the peer.
-3. Use **Restart both ComfyUI workers** in the cluster dashboard. If the
-   dashboard is not installed, restart each worker from its Manager interface.
-4. Import the workflow and confirm that neither worker reports missing nodes
-   or import failures.
+   node's dependencies in the controller's local virtual environment.
+2. Restart controller ComfyUI from the cluster dashboard or Manager.
+3. Import the workflow and confirm that the controller reports no missing
+   nodes or import failures.
 
 The source tree is shared, but Python dependencies and loaded process state
-are not. A custom node is cluster-ready only after it loads successfully on
-both workers.
+are not. If the standby peer instance will be used, start it only when Qwen is
+idle, install the dependency in its local virtual environment, and verify it
+separately. Pass `--service-mode active` when rerunning the peer installer only
+if peer ComfyUI should become boot-persistent.
 
 When converting existing installations, rerun `setup-comfyui.sh` on the
 controller first and the peer second. The controller's copy is canonical. The

@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SERVER_HOST="${SERVER_HOST:-}"
 PEER_HOST="${PEER_HOST:-}"
@@ -18,8 +19,16 @@ SHARE_GID="${SHARE_GID:-971}"
 COMFY_ROOT="${COMFY_ROOT:-/srv/comfyui}"
 COMFY_LOCAL_CACHE="${COMFY_LOCAL_CACHE:-/var/lib/comfyui-local}"
 COMFY_DIR="${COMFY_DIR:-}"
+COMFYUI_REPO="${COMFYUI_REPO:-https://github.com/Comfy-Org/ComfyUI.git}"
+COMFYUI_COMMIT="${COMFYUI_COMMIT:-b0b743566f65daafc423b4fea8a2fbda94b3384a}"
+COMFYUI_PATCH_SOURCE="${COMFYUI_PATCH_SOURCE:-$SCRIPT_DIR/patches/comfyui/comfyui-b0b7435-hunyuan3d-rocm-sdpa.patch}"
+COMFYUI_PATCH="/usr/local/share/comfyui/comfyui-b0b7435-hunyuan3d-rocm-sdpa.patch"
+HY3D_SDPA_MODE="${HY3D_SDPA_MODE:-auto}"
+HY3D_SDPA_PROBE_SOURCE="${HY3D_SDPA_PROBE_SOURCE:-$SCRIPT_DIR/scripts/comfyui-hy3d-sdpa-probe.py}"
+HY3D_SDPA_PROBE="/usr/local/libexec/comfyui-hy3d-sdpa-probe.py"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
+COMFY_SERVICE_MODE="${COMFY_SERVICE_MODE:-auto}"
 LAN_NETS="${LAN_NETS:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
 CONFIGURE_FIREWALL="${CONFIGURE_FIREWALL:-1}"
 INSTALL_COMFY_SMB="${INSTALL_COMFY_SMB:-1}"
@@ -85,7 +94,7 @@ Usage:
   sudo bash $SCRIPT_NAME --server <hostname> --peer <hostname> [options]
 
 Installs only:
-  - One local ComfyUI service on this node
+  - One local ComfyUI service (controller active, peer standby by default)
   - One read-write NFS ComfyUI store shared by both nodes
   - One anonymous read-write Windows workspace share at \\\\<server>\\$COMFY_SMB_SHARE
   - LAN access to this node's ComfyUI web service
@@ -113,6 +122,9 @@ ComfyUI:
   --port <port>                Web service port (default: $COMFYUI_PORT)
   --comfy-cache <mode>         ram, classic, lru, or none
   --reserve-vram <gib>         GPU memory ComfyUI leaves free (default: $COMFY_RESERVE_VRAM)
+  --hy3d-sdpa <mode>           auto, default, or math (default: $HY3D_SDPA_MODE)
+  --service-mode <mode>        active, standby, or auto; auto starts the
+                               server role and leaves the peer in standby
   --preview <mode>             none, auto, latent2rgb, or taesd
   --enable-assets              Enable the shared-store asset scanner
   --disable-api-nodes          Disable frontend API nodes
@@ -218,6 +230,16 @@ while [ "$#" -gt 0 ]; do
       COMFY_RESERVE_VRAM="$2"
       shift
       ;;
+    --hy3d-sdpa)
+      need_arg "$1" "${2:-}"
+      HY3D_SDPA_MODE="$2"
+      shift
+      ;;
+    --service-mode)
+      need_arg "$1" "${2:-}"
+      COMFY_SERVICE_MODE="$2"
+      shift
+      ;;
     --preview)
       need_arg "$1" "${2:-}"
       COMFY_PREVIEW_METHOD="$2"
@@ -306,6 +328,18 @@ case "$COMFY_PREVIEW_METHOD" in
   none|auto|latent2rgb|taesd) ;;
   *) die "--preview must be none, auto, latent2rgb, or taesd" ;;
 esac
+case "$COMFY_SERVICE_MODE" in
+  active|standby|auto) ;;
+  *) die "--service-mode must be active, standby, or auto" ;;
+esac
+case "$HY3D_SDPA_MODE" in
+  auto|default|math) ;;
+  *) die "--hy3d-sdpa must be auto, default, or math" ;;
+esac
+[[ "$COMFYUI_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+  || die "COMFYUI_COMMIT must be a full lowercase 40-character Git commit"
+[ -r "$COMFYUI_PATCH_SOURCE" ] || die "ComfyUI compatibility patch not found: $COMFYUI_PATCH_SOURCE"
+[ -r "$HY3D_SDPA_PROBE_SOURCE" ] || die "Hunyuan3D SDPA probe not found: $HY3D_SDPA_PROBE_SOURCE"
 
 for value in "$COMFY_CACHE_ACTIVE_GB" "$COMFY_CACHE_INACTIVE_GB" "$COMFY_RESERVE_VRAM"; do
   [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "ComfyUI memory values must be numeric GiB values"
@@ -357,6 +391,13 @@ else
   OTHER_HOST="$SERVER_HOST"
   OTHER_IP="$SERVER_IP"
 fi
+if [ "$COMFY_SERVICE_MODE" = "auto" ]; then
+  if [ "$IS_SERVER" = "1" ]; then
+    COMFY_SERVICE_MODE=active
+  else
+    COMFY_SERVICE_MODE=standby
+  fi
+fi
 
 USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ] || die "home directory for '$TARGET_USER' was not found"
@@ -373,6 +414,244 @@ TARGET_PRIMARY_GROUP="$(id -gn "$TARGET_USER")"
 
 as_user() {
   sudo -u "$TARGET_USER" -H bash -lc "$1"
+}
+
+comfy_git() {
+  sudo -u "$TARGET_USER" -H git -C "$COMFY_DIR" "$@"
+}
+
+MANAGED_CHECKOUT_LINKS=()
+
+restore_managed_checkout_links() {
+  local expected_target
+  local managed_path
+  local relative_path
+
+  MANAGED_CHECKOUT_LINKS=()
+  for relative_path in models custom_nodes input output; do
+    managed_path="$COMFY_DIR/$relative_path"
+    expected_target="$COMFY_ROOT/$relative_path"
+    [ -L "$managed_path" ] || continue
+    [ "$(readlink "$managed_path")" = "$expected_target" ] \
+      || die "refusing to replace unmanaged symlink: $managed_path"
+
+    MANAGED_CHECKOUT_LINKS+=("$relative_path")
+  done
+
+  if [ "${#MANAGED_CHECKOUT_LINKS[@]}" -gt 0 ]; then
+    for relative_path in "${MANAGED_CHECKOUT_LINKS[@]}"; do
+      sudo -u "$TARGET_USER" -H unlink -- "$COMFY_DIR/$relative_path"
+    done
+    if ! comfy_git restore --source=HEAD --staged --worktree -- "${MANAGED_CHECKOUT_LINKS[@]}"; then
+      for relative_path in "${MANAGED_CHECKOUT_LINKS[@]}"; do
+        sudo -u "$TARGET_USER" -H rm -rf -- "$COMFY_DIR/$relative_path" || true
+        sudo -u "$TARGET_USER" -H ln -s \
+          "$COMFY_ROOT/$relative_path" "$COMFY_DIR/$relative_path" || true
+      done
+      die "could not restore tracked files while preparing the pinned ComfyUI checkout"
+    fi
+    ok "temporarily restored tracked ComfyUI files for the pinned checkout"
+  fi
+}
+
+reinstate_managed_checkout_links() {
+  local expected_target
+  local managed_path
+  local path_status
+  local relative_path
+
+  for relative_path in "${MANAGED_CHECKOUT_LINKS[@]}"; do
+    managed_path="$COMFY_DIR/$relative_path"
+    expected_target="$COMFY_ROOT/$relative_path"
+
+    if [ -L "$managed_path" ]; then
+      [ "$(readlink "$managed_path")" = "$expected_target" ] \
+        || die "refusing to replace unmanaged symlink: $managed_path"
+      continue
+    fi
+
+    if [ -e "$managed_path" ]; then
+      path_status="$(comfy_git status --porcelain --untracked-files=all -- "$relative_path")"
+      [ -z "$path_status" ] \
+        || die "refusing to discard unexpected files restored below $managed_path"
+      sudo -u "$TARGET_USER" -H rm -rf -- "$managed_path"
+    fi
+    sudo -u "$TARGET_USER" -H ln -s "$expected_target" "$managed_path"
+  done
+
+  if [ "${#MANAGED_CHECKOUT_LINKS[@]}" -gt 0 ]; then
+    ok "restored managed shared-workspace links without copying checkout files"
+  fi
+  MANAGED_CHECKOUT_LINKS=()
+}
+
+verify_comfyui_checkout_changes() {
+  local actual_commit="$1"
+  local changed_path
+  local expected_target
+  local managed_root
+
+  while IFS= read -r changed_path; do
+    case "$changed_path" in
+      comfy/ldm/hunyuan3d/vae.py)
+        [ "$actual_commit" = "$COMFYUI_COMMIT" ] \
+          || die "refusing to overwrite a modified $changed_path at an unmanaged revision"
+        comfy_git apply --reverse --check "$COMFYUI_PATCH" \
+          || die "refusing to overwrite non-managed edits in $changed_path"
+        ;;
+      models/*|custom_nodes/*|input/*|output/*)
+        managed_root="${changed_path%%/*}"
+        expected_target="$COMFY_ROOT/$managed_root"
+        [ -L "$COMFY_DIR/$managed_root" ] \
+          && [ "$(readlink "$COMFY_DIR/$managed_root")" = "$expected_target" ] \
+          || die "refusing to overwrite non-managed changes below $managed_root"
+        ;;
+      *)
+        die "refusing to overwrite tracked change in $COMFY_DIR: $changed_path"
+        ;;
+    esac
+  done < <(comfy_git diff --name-only HEAD)
+}
+
+first_unmanaged_checkout_change() {
+  local changed_path
+
+  while IFS= read -r changed_path; do
+    case "$changed_path" in
+      models/*|custom_nodes/*|input/*|output/*)
+        ;;
+      *)
+        printf '%s\n' "$changed_path"
+        return 0
+        ;;
+    esac
+  done < <(comfy_git diff --name-only HEAD)
+}
+
+prepare_comfyui_checkout() {
+  local actual_commit
+  local existing_checkout=0
+  local managed_patch_removed=0
+  local remaining_change
+  local tracked_changes
+
+  if [ -e "$COMFY_DIR" ] && [ ! -d "$COMFY_DIR/.git" ]; then
+    die "$COMFY_DIR exists but is not a Git checkout"
+  fi
+
+  if [ ! -d "$COMFY_DIR/.git" ]; then
+    sudo -u "$TARGET_USER" -H git clone --no-checkout "$COMFYUI_REPO" "$COMFY_DIR"
+  else
+    existing_checkout=1
+    actual_commit="$(comfy_git rev-parse HEAD)"
+    verify_comfyui_checkout_changes "$actual_commit"
+  fi
+
+  log "Pinning ComfyUI at $COMFYUI_COMMIT"
+  if ! comfy_git fetch --tags --prune origin; then
+    if comfy_git cat-file -e "$COMFYUI_COMMIT^{commit}"; then
+      warn "could not refresh ComfyUI from origin; using the locally cached pinned commit"
+    else
+      die "could not fetch pinned ComfyUI commit $COMFYUI_COMMIT"
+    fi
+  fi
+  if ! comfy_git cat-file -e "$COMFYUI_COMMIT^{commit}"; then
+    comfy_git fetch --depth 1 origin "$COMFYUI_COMMIT" \
+      || die "could not fetch pinned ComfyUI commit $COMFYUI_COMMIT"
+  fi
+
+  if [ "$existing_checkout" = "1" ]; then
+    if [ "$actual_commit" = "$COMFYUI_COMMIT" ] \
+        && comfy_git apply --reverse --check "$COMFYUI_PATCH"; then
+      comfy_git apply --reverse "$COMFYUI_PATCH"
+      managed_patch_removed=1
+      ok "removed the previously managed ComfyUI patch"
+    fi
+
+    remaining_change="$(first_unmanaged_checkout_change)"
+    if [ -n "$remaining_change" ]; then
+      if [ "$managed_patch_removed" = "1" ]; then
+        comfy_git apply "$COMFYUI_PATCH" \
+          || warn "could not restore the managed Hunyuan3D patch after detecting other edits"
+      fi
+      die "refusing to overwrite tracked change in $COMFY_DIR: $remaining_change"
+    fi
+
+    restore_managed_checkout_links
+    tracked_changes="$(comfy_git status --porcelain --untracked-files=no)"
+    if [ -n "$tracked_changes" ]; then
+      reinstate_managed_checkout_links
+      if [ "$managed_patch_removed" = "1" ]; then
+        comfy_git apply "$COMFYUI_PATCH" \
+          || warn "could not restore the managed Hunyuan3D patch after checkout validation failed"
+      fi
+      die "refusing to overwrite tracked changes in $COMFY_DIR; preserve or revert them, then rerun"
+    fi
+  fi
+
+  if ! comfy_git checkout --detach "$COMFYUI_COMMIT"; then
+    reinstate_managed_checkout_links
+    if [ "$managed_patch_removed" = "1" ]; then
+      comfy_git apply "$COMFYUI_PATCH" \
+        || warn "could not restore the managed Hunyuan3D patch after checkout failed"
+    fi
+    die "could not check out pinned ComfyUI revision $COMFYUI_COMMIT"
+  fi
+
+  actual_commit="$(comfy_git rev-parse HEAD)"
+  if [ "$actual_commit" != "$COMFYUI_COMMIT" ]; then
+    reinstate_managed_checkout_links
+    die "ComfyUI checkout resolved to $actual_commit instead of $COMFYUI_COMMIT"
+  fi
+
+  if ! comfy_git apply --check "$COMFYUI_PATCH"; then
+    reinstate_managed_checkout_links
+    die "the managed Hunyuan3D patch does not apply to ComfyUI $COMFYUI_COMMIT"
+  fi
+  if ! comfy_git apply "$COMFYUI_PATCH"; then
+    reinstate_managed_checkout_links
+    die "could not apply the managed Hunyuan3D patch"
+  fi
+  if ! comfy_git diff --check; then
+    comfy_git apply --reverse "$COMFYUI_PATCH" || true
+    reinstate_managed_checkout_links
+    die "the managed Hunyuan3D patch introduced a whitespace error"
+  fi
+  reinstate_managed_checkout_links
+  ok "pinned and patched ComfyUI $COMFYUI_COMMIT"
+}
+
+if [ "$IS_SERVER" = "1" ]; then
+  QWEN_SERVICE_UNIT="qwen3d8-server.service"
+else
+  QWEN_SERVICE_UNIT="qwen3d8-rpc.service"
+fi
+QWEN_WAS_ACTIVE=0
+QWEN_MAIN_PID_BEFORE=""
+
+capture_qwen_service_state() {
+  if systemctl is-active --quiet "$QWEN_SERVICE_UNIT"; then
+    QWEN_WAS_ACTIVE=1
+    QWEN_MAIN_PID_BEFORE="$(systemctl show "$QWEN_SERVICE_UNIT" --property MainPID --value)"
+    [[ "$QWEN_MAIN_PID_BEFORE" =~ ^[1-9][0-9]*$ ]] \
+      || die "$QWEN_SERVICE_UNIT is active but has no valid main PID"
+    ok "will preserve active $QWEN_SERVICE_UNIT process $QWEN_MAIN_PID_BEFORE"
+  else
+    ok "$QWEN_SERVICE_UNIT is inactive and will be left unchanged"
+  fi
+}
+
+verify_qwen_service_unchanged() {
+  local current_pid
+
+  [ "$QWEN_WAS_ACTIVE" = "1" ] || return 0
+  systemctl is-active --quiet "$QWEN_SERVICE_UNIT" \
+    || die "$QWEN_SERVICE_UNIT was active before setup but is no longer active"
+
+  current_pid="$(systemctl show "$QWEN_SERVICE_UNIT" --property MainPID --value)"
+  [ "$current_pid" = "$QWEN_MAIN_PID_BEFORE" ] \
+    || die "$QWEN_SERVICE_UNIT main PID changed from $QWEN_MAIN_PID_BEFORE to $current_pid"
+  ok "$QWEN_SERVICE_UNIT remained active with PID $current_pid"
 }
 
 ensure_share_group() {
@@ -426,6 +705,8 @@ normalize_shared_workspace_permissions() {
 # =============================================================================
 # 2. SHARED NFS STORE
 # =============================================================================
+capture_qwen_service_state
+
 export DEBIAN_FRONTEND=noninteractive
 log "Installing ComfyUI and shared-store prerequisites"
 apt-get update -y
@@ -699,15 +980,9 @@ install_uv() {
 install_uv
 
 log "Installing the local ComfyUI checkout"
-if [ -d "$COMFY_DIR/.git" ]; then
-  if as_user "cd '$COMFY_DIR' && git pull --ff-only"; then
-    ok "updated the existing ComfyUI checkout"
-  else
-    warn "the existing ComfyUI checkout could not be fast-forwarded; keeping its current revision"
-  fi
-else
-  as_user "git clone https://github.com/comfyanonymous/ComfyUI '$COMFY_DIR'"
-fi
+install -D -m 0644 -o root -g root "$COMFYUI_PATCH_SOURCE" "$COMFYUI_PATCH"
+install -D -m 0755 -o root -g root "$HY3D_SDPA_PROBE_SOURCE" "$HY3D_SDPA_PROBE"
+prepare_comfyui_checkout
 
 install -d -m 2775 -o "$TARGET_USER" -g "$SHARE_GROUP" \
   "$COMFY_LOCAL_CACHE" "$COMFY_LOCAL_CACHE/temp"
@@ -1067,6 +1342,30 @@ else
   die "ComfyUI Python provisioning failed; rerun: sudo -u $TARGET_USER bash $USER_HOME/.comfyui_provision.sh"
 fi
 
+COMFY_ROCM_PATH="$COMFY_DIR/.venv/lib/python$COMFY_PY/site-packages/_rocm_sdk_core"
+HY3D_SDPA_STATE_FILE="$COMFY_LOCAL_CACHE/hy3d-sdpa-mode"
+
+log "Selecting a Hunyuan3D SDPA backend with isolated GPU probes"
+if as_user "ROCM_PATH='$COMFY_ROCM_PATH' HIP_PATH='$COMFY_ROCM_PATH' PYTORCH_ROCM_ARCH='$ROCM_GFX' '$COMFY_DIR/.venv/bin/python' '$HY3D_SDPA_PROBE' --requested-mode '$HY3D_SDPA_MODE' --state-file '$HY3D_SDPA_STATE_FILE'"; then
+  ok "Hunyuan3D SDPA compatibility probe completed"
+else
+  die "Hunyuan3D SDPA compatibility probe failed; no safe backend policy was selected"
+fi
+
+HY3D_SDPA_SELECTED="$(tr -d '[:space:]' < "$HY3D_SDPA_STATE_FILE")"
+case "$HY3D_SDPA_SELECTED" in
+  default)
+    HY3D_FORCE_MATH_SDPA=0
+    ;;
+  math)
+    HY3D_FORCE_MATH_SDPA=1
+    ;;
+  *)
+    die "invalid Hunyuan3D SDPA probe state: $HY3D_SDPA_SELECTED"
+    ;;
+esac
+ok "Hunyuan3D SDPA policy selected: $HY3D_SDPA_SELECTED"
+
 comfy_has_flag() {
   as_user "grep -q -- '$1' '$COMFY_DIR/comfy/cli_args.py'"
 }
@@ -1199,6 +1498,7 @@ Environment=HF_HUB_CACHE=$COMFY_ROOT/hf/hub
 Environment=ROCM_PATH=$COMFY_ROCM_PATH
 Environment=HIP_PATH=$COMFY_ROCM_PATH
 Environment=PYTORCH_ROCM_ARCH=$ROCM_GFX
+Environment=COMFY_HY3D_FORCE_MATH_SDPA=$HY3D_FORCE_MATH_SDPA
 WorkingDirectory=$COMFY_DIR
 $SERVICE_MOUNT_GATE
 ExecStart=$COMFY_DIR/.venv/bin/python $COMFY_DIR/main.py --listen $BIND_ADDR --port $COMFYUI_PORT $COMFY_MANAGER_FLAG $COMFY_TEMP_FLAG $COMFY_TUNE_FLAGS
@@ -1210,15 +1510,21 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-ensure_boot_unit comfyui.service
-if [ "$IS_PEER" = "1" ] && ! findmnt -T "$COMFY_ROOT" -n -o FSTYPE 2>/dev/null | grep nfs >/dev/null; then
-  systemctl start --no-block comfyui.service >/dev/null 2>&1 || true
-  warn "comfyui.service is enabled and waiting for the shared NFS store"
-elif systemctl restart comfyui.service >/dev/null 2>&1; then
-  ok "comfyui.service running on $BIND_ADDR:$COMFYUI_PORT"
+if [ "$COMFY_SERVICE_MODE" = "standby" ]; then
+  systemctl disable --now comfyui.service >/dev/null 2>&1 \
+    || die "could not place comfyui.service in standby"
+  ok "comfyui.service installed in standby and disabled at boot"
 else
-  warn "comfyui.service did not start immediately"
-  note_action "Inspect it with: systemctl status comfyui.service --no-pager"
+  ensure_boot_unit comfyui.service
+  if [ "$IS_PEER" = "1" ] && ! findmnt -T "$COMFY_ROOT" -n -o FSTYPE 2>/dev/null | grep nfs >/dev/null; then
+    systemctl start --no-block comfyui.service >/dev/null 2>&1 || true
+    warn "comfyui.service is enabled and waiting for the shared NFS store"
+  elif systemctl restart comfyui.service >/dev/null 2>&1; then
+    ok "comfyui.service running on $BIND_ADDR:$COMFYUI_PORT"
+  else
+    warn "comfyui.service did not start immediately"
+    note_action "Inspect it with: systemctl status comfyui.service --no-pager"
+  fi
 fi
 
 # =============================================================================
@@ -1263,6 +1569,7 @@ configure_firewall() {
 }
 
 configure_firewall
+verify_qwen_service_unchanged
 
 LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')"
 [ -n "$LAN_IP" ] || LAN_IP="$MY_HOST"
@@ -1270,7 +1577,14 @@ LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if (
 echo
 echo "${GRN}${BOLD}ComfyUI setup complete on $MY_HOST${RST}"
 echo "  Role:          $NODE_ROLE"
-echo "  Web service:   http://$LAN_IP:$COMFYUI_PORT"
+echo "  Service mode:  $COMFY_SERVICE_MODE"
+echo "  Revision:      ${COMFYUI_COMMIT:0:12}"
+echo "  HY3D SDPA:     $HY3D_SDPA_SELECTED (requested: $HY3D_SDPA_MODE)"
+if [ "$COMFY_SERVICE_MODE" = "active" ]; then
+  echo "  Web service:   http://$LAN_IP:$COMFYUI_PORT"
+else
+  echo "  Web service:   standby; start manually with: sudo systemctl start comfyui.service"
+fi
 echo "  Shared store:  $COMFY_ROOT"
 if [ "$IS_SERVER" = "1" ]; then
   echo "  NFS export:    $COMFY_ROOT -> $PEER_IP"

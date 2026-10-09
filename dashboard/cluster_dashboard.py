@@ -29,11 +29,13 @@ COMFYUI_CONTROLLER_RESTART_CONFIRMATION = (
     "interrupted."
 )
 COMFYUI_PEER_RESTART_CONFIRMATION = (
-    "Restart peer ComfyUI? Active workflows on the peer will be interrupted."
+    "Start or restart peer ComfyUI? The peer is standby by default. Running "
+    "it reduces Qwen RPC memory headroom, and active peer workflows will be "
+    "interrupted."
 )
 COMFYUI_BOTH_RESTART_CONFIRMATION = (
-    "Restart both ComfyUI workers? Every active ComfyUI workflow will be "
-    "interrupted."
+    "Start or restart both ComfyUI instances? This starts the standby peer, "
+    "reduces Qwen RPC memory headroom, and interrupts active workflows."
 )
 
 try:
@@ -993,10 +995,10 @@ def build_demo(app: DashboardApp) -> Any:
                     "Restart controller ComfyUI", variant="stop"
                 )
                 restart_peer_comfyui_button = gr.Button(
-                    "Restart peer ComfyUI", variant="stop"
+                    "Start/restart peer ComfyUI", variant="stop"
                 )
                 restart_both_comfyui_button = gr.Button(
-                    "Restart both ComfyUI workers", variant="stop"
+                    "Start/restart both ComfyUI instances", variant="stop"
                 )
 
         gr.Markdown("## On-demand verification")
