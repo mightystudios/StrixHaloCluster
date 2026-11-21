@@ -40,7 +40,7 @@ MODEL_QUANT=""
 MODEL_DIR=""
 MODEL_FILE=""
 MODEL_REPO="${MODEL_REPO:-unsloth/Qwen3.8-Flash-Next-GGUF}"
-MODEL_REVISION="${MODEL_REVISION:-38bb39ee97821de2c9009abb7e93950eec396e66}"
+MODEL_REVISION="${MODEL_REVISION:-f5d175de2cf7f720d45d6064019a81fcf056e986}"
 MODEL_EXPECTED_BYTES=""
 MODEL_SHARD_COUNT=""
 MODEL_MEMORY_ESTIMATE_GIB=""
@@ -70,9 +70,9 @@ CONTEXT_SCALING="native"
 YARN_ROPE_SCALE=""
 YARN_MODEL_CONTEXT_OVERRIDE=""
 YARN_SERVER_ARGS=""
-KV_CACHE_TYPE="${KV_CACHE_TYPE:-f16}"
+KV_CACHE_TYPE="${KV_CACHE_TYPE:-q8_0}"
 TENSOR_SPLIT="${TENSOR_SPLIT:-}"
-Q4_TWO_SLOT_BALANCE="24,76"
+Q4_TWO_SLOT_BALANCE="20,80"
 HOST_BUFFER_ESTIMATE_GIB="${HOST_BUFFER_ESTIMATE_GIB:-60}"
 MIN_HEADROOM_GIB="${MIN_HEADROOM_GIB:-8}"
 KV_MEMORY_ESTIMATE_GIB=""
@@ -145,7 +145,7 @@ Options:
   --balance <a,b>            Controller,peer ratio (default: Q4 with two slots
                              uses $Q4_TWO_SLOT_BALANCE; other profiles are computed)
   --context <K>              Context per slot in Ki-tokens; 256 = 262,144 tokens
-                             (default: 192 = 196,608 tokens; Q4 maximum: 512)
+                             (default: Q4 = 512; Q5/Q6 = 256)
                              Q4 contexts above 256 use YaRN automatically;
                              Q5 and Q6 are limited to the native 256 Ki context.
   --user <name>              Desktop account passed to setup-environment.sh
@@ -167,8 +167,9 @@ Options:
 Planning values:
   Q4 = 110 GiB, Q5 = 150 GiB, Q6 = 160 GiB.
   Controller-only Gated DeltaNet host buffer allowance = 60 GiB.
-  The Q4 two-slot profile uses balance $Q4_TWO_SLOT_BALANCE to reserve controller
-  headroom for ComfyUI. Other profiles compute a balance from estimated use.
+  The Q4 default profile uses two 512 Ki slots, $KV_CACHE_TYPE KV, and balance
+  $Q4_TWO_SLOT_BALANCE to reserve controller headroom for ComfyUI. Other
+  profiles compute a balance from estimated use.
 
 Known upstream-tracker report:
   A non-maintainer user reported that Qwen3.8 Q5/Q6 RPC on two gfx1151 nodes
@@ -292,7 +293,7 @@ resolve_quant() {
       QUANT=Q4
       MODEL_QUANT=UD-Q4_K_XL
       MODEL_SHARD_COUNT=4
-      MODEL_EXPECTED_BYTES=111334654784
+      MODEL_EXPECTED_BYTES=111334654778
       MODEL_MEMORY_ESTIMATE_GIB=110
       MODEL_FILE="$MODEL_ROOT/$MODEL_QUANT/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
       ;;
@@ -458,7 +459,11 @@ if [ -z "$CONTEXT_K" ]; then
       || die "CONTEXT_PER_SLOT must be a whole multiple of 1024 tokens"
     CONTEXT_K=$((LEGACY_CONTEXT_PER_SLOT / 1024))
   else
-    CONTEXT_K=192
+    if [ "$QUANT" = "Q4" ]; then
+      CONTEXT_K=512
+    else
+      CONTEXT_K="$NATIVE_CONTEXT_K"
+    fi
   fi
 fi
 [[ "$CONTEXT_K" =~ ^[0-9]+$ ]] || die "--context must be a whole Ki-token value"
@@ -544,7 +549,7 @@ else
 fi
 echo "  exact artifact:           $MODEL_ARTIFACT_GIB GiB"
 echo "  rounded model budget:     $MODEL_MEMORY_ESTIMATE_GIB GiB"
-echo "  KV estimate:              $KV_MEMORY_ESTIMATE_GIB GiB"
+echo "  KV cache:                 $KV_CACHE_TYPE ($KV_MEMORY_ESTIMATE_GIB GiB estimate)"
 echo "  controller-only buffer:   $HOST_BUFFER_ESTIMATE_GIB GiB"
 echo "  balance:                  $TENSOR_SPLIT (controller,peer)"
 echo "  estimated controller use: $CONTROLLER_ESTIMATE_GIB GiB"
@@ -975,6 +980,8 @@ RPC_PORT=$RPC_PORT
 LLAMA_PORT=$LLAMA_PORT
 RPC_CACHE=$RPC_CACHE
 RPC_CACHE_ENABLED=$RPC_CACHE_ENABLED
+MODEL_REPO=$MODEL_REPO
+MODEL_REVISION=$MODEL_REVISION
 MODEL_FILE=$MODEL_FILE
 MODEL_EXPECTED_BYTES=$MODEL_EXPECTED_BYTES
 MODEL_ARTIFACT_GIB=$MODEL_ARTIFACT_GIB
@@ -1020,7 +1027,9 @@ set -uo pipefail
 
 echo "role: ${NODE_ROLE:-unknown}"
 echo "quant: ${MODEL_QUANT:-unknown}"
+echo "model revision: ${MODEL_REVISION:-unknown}"
 echo "balance: ${TENSOR_SPLIT:-unknown}"
+echo "KV cache: ${KV_CACHE_TYPE:-unknown}"
 echo "context: ${CONTEXT_K:-?} Ki per slot (${CONTEXT_PER_SLOT:-?} tokens; ${CONTEXT_SCALING:-native})"
 if [ "${CONTEXT_SCALING:-native}" = "yarn" ]; then
   echo "YaRN: ${YARN_ROPE_SCALE:-?}x from ${NATIVE_CONTEXT_PER_SLOT:-262144} tokens"
@@ -1342,8 +1351,10 @@ echo
 echo "${GRN}${BOLD}Qwen3.8 $QUANT installation complete on $(hostname -s)${RST}"
 echo "  role:          $NODE_ROLE"
 echo "  quant:         $MODEL_QUANT"
+echo "  revision:      $MODEL_REVISION"
 echo "  slots:         $PARALLEL_SLOTS"
 echo "  balance:       $TENSOR_SPLIT (controller,peer)"
+echo "  KV cache:      $KV_CACHE_TYPE"
 echo "  context:       ${CONTEXT_K} Ki per slot ($CONTEXT_PER_SLOT tokens; $CONTEXT_SCALING)"
 if [ "$CONTEXT_SCALING" = "yarn" ]; then
   echo "  YaRN scale:    ${YARN_ROPE_SCALE}x from $NATIVE_CONTEXT_PER_SLOT tokens"

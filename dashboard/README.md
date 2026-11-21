@@ -12,8 +12,8 @@ Run the installer on the controller and worker after the normal cluster setup:
 ```bash
 # For two extended 512 Ki Q4 slots with controller ComfyUI headroom:
 # setup-qwen3d8.sh enables 2x YaRN automatically above the native 256 Ki limit.
-sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 512 --skip-foundation
-sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 512 --skip-foundation
+sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 20,80 --context 512 --kv-cache q8_0 --skip-foundation
+sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 20,80 --context 512 --kv-cache q8_0 --skip-foundation
 
 # Controller
 sudo bash dashboard/setup-dashboard.sh \
@@ -129,8 +129,9 @@ repetitions to `1` to disable aggregation, or use `--no-warmup` for a cold
 measurement. The action asks for confirmation because it interrupts normal
 inference and sends synthetic requests. The dashboard shows the parameters
 and median from the latest recorded series below the aggregate results.
-The output-token setting is a maximum because the test honors the model's
-natural end-of-sequence token.
+The output-token setting is exact for this synthetic timing workload because
+the capacity request ignores the model's natural end-of-sequence token. Normal
+chat and completion requests are unaffected.
 The capacity-test timeout is derived automatically from the requested token
 workload and parallel-slot count, with extra headroom for long-context tests.
 An optional `capacity_timeout` value in the dashboard JSON can override that

@@ -60,7 +60,11 @@ except ImportError:
 
 
 TARGET_PARALLEL_SLOTS = 2
-TARGET_CONTEXT_TOKENS = 262144
+TARGET_CONTEXT_TOKENS = 524288
+TARGET_NATIVE_CONTEXT_TOKENS = 262144
+TARGET_MODEL_REVISION = "f5d175de2cf7f720d45d6064019a81fcf056e986"
+TARGET_TENSOR_SPLIT = "20,80"
+TARGET_KV_CACHE_TYPE = "q8_0"
 DEFAULT_OUTPUT_TOKENS = 2048
 DEFAULT_TEST_SAFETY_MARGIN = 96
 DEFAULT_CAPACITY_INPUT_TOKENS = 65536
@@ -250,10 +254,19 @@ def configuration_test(
         config.get("expected_context_per_slot", TARGET_CONTEXT_TOKENS)
     )
     native_context = int(
-        config.get("native_context_per_slot", TARGET_CONTEXT_TOKENS)
+        config.get("native_context_per_slot", TARGET_NATIVE_CONTEXT_TOKENS)
     )
     if native_context < 1:
-        native_context = TARGET_CONTEXT_TOKENS
+        native_context = TARGET_NATIVE_CONTEXT_TOKENS
+    expected_revision = str(
+        config.get("expected_model_revision", TARGET_MODEL_REVISION)
+    )
+    expected_split = str(
+        config.get("expected_tensor_split", TARGET_TENSOR_SPLIT)
+    )
+    expected_kv_cache = str(
+        config.get("expected_kv_cache_type", TARGET_KV_CACHE_TYPE)
+    )
     requires_yarn = expected_context > native_context
     expected_yarn_scale = expected_context / native_context
     env_path = Path("/etc/qwen3d8/cluster.env")
@@ -274,6 +287,36 @@ def configuration_test(
         _pass(result, f"Q4 model selected: {env.get('MODEL_QUANT')}")
     else:
         _fail(result, f"expected a Q4 model, found {env.get('MODEL_QUANT', 'unset')}")
+
+    actual_revision = env.get("MODEL_REVISION")
+    if actual_revision == expected_revision:
+        _pass(result, f"cluster.env pins model revision {actual_revision}")
+    else:
+        _fail(
+            result,
+            "cluster.env pins model revision "
+            f"{actual_revision or 'unset'}; expected {expected_revision}",
+        )
+
+    actual_split = env.get("TENSOR_SPLIT")
+    if actual_split == expected_split:
+        _pass(result, f"cluster.env declares tensor split {actual_split}")
+    else:
+        _fail(
+            result,
+            f"cluster.env declares split {actual_split or 'unset'}; "
+            f"expected {expected_split}",
+        )
+
+    actual_kv_cache = env.get("KV_CACHE_TYPE")
+    if actual_kv_cache == expected_kv_cache:
+        _pass(result, f"cluster.env declares {actual_kv_cache} KV cache")
+    else:
+        _fail(
+            result,
+            f"cluster.env declares {actual_kv_cache or 'unset'} KV cache; "
+            f"expected {expected_kv_cache}",
+        )
 
     actual_slots = env.get("PARALLEL_SLOTS")
     if actual_slots == str(expected_slots):
@@ -335,6 +378,9 @@ def configuration_test(
         _progress(progress, 0.35, "Configuration: checking llama-server")
         unit_slots = _flag_value(unit_text, "--parallel")
         unit_context = _flag_value(unit_text, "--kv-unified-per-slot")
+        unit_split = _flag_value(unit_text, "--tensor-split")
+        unit_cache_k = _flag_value(unit_text, "--cache-type-k")
+        unit_cache_v = _flag_value(unit_text, "--cache-type-v")
         if unit_slots == str(expected_slots):
             _pass(result, f"systemd starts llama-server with --parallel {unit_slots}")
         else:
@@ -354,6 +400,23 @@ def configuration_test(
                 "systemd uses "
                 f"--kv-unified-per-slot {unit_context or 'unset'}; "
                 f"expected {expected_context}",
+            )
+        if unit_split == expected_split:
+            _pass(result, f"systemd uses tensor split {unit_split}")
+        else:
+            _fail(
+                result,
+                f"systemd uses tensor split {unit_split or 'unset'}; "
+                f"expected {expected_split}",
+            )
+        if unit_cache_k == expected_kv_cache and unit_cache_v == expected_kv_cache:
+            _pass(result, f"systemd uses {expected_kv_cache} K/V cache")
+        else:
+            _fail(
+                result,
+                "systemd uses K/V cache "
+                f"{unit_cache_k or 'unset'}/{unit_cache_v or 'unset'}; "
+                f"expected {expected_kv_cache}/{expected_kv_cache}",
             )
         if requires_yarn:
             expected_override = f"qwen4exp.context_length=int:{expected_context}"
@@ -439,6 +502,9 @@ def configuration_test(
         "expected_parallel_slots": expected_slots,
         "expected_context_per_slot": expected_context,
         "native_context_per_slot": native_context,
+        "expected_model_revision": expected_revision,
+        "expected_tensor_split": expected_split,
+        "expected_kv_cache_type": expected_kv_cache,
         "requires_yarn": requires_yarn,
         "environment": env,
     }
@@ -590,7 +656,7 @@ def capacity_test(
             "prompt": token_ids,
             "id_slot": slot,
             "n_predict": output_tokens,
-            "ignore_eos": False,
+            "ignore_eos": True,
             "cache_prompt": False,
             "stream": False,
             "temperature": 0,

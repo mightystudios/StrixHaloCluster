@@ -31,10 +31,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "iperf_port": 5201,
     "cluster_iface": "usb4llm0",
     "parallel_slots": 2,
-    "context_per_slot": 262144,
+    "context_per_slot": 524288,
     "native_context_per_slot": 262144,
-    "context_scaling": "native",
-    "yarn_rope_scale": 0.0,
+    "context_scaling": "yarn",
+    "yarn_rope_scale": 2.0,
+    "model_revision": "",
+    "tensor_split": "",
+    "kv_cache_type": "",
+    "expected_model_revision": "f5d175de2cf7f720d45d6064019a81fcf056e986",
+    "expected_tensor_split": "20,80",
+    "expected_kv_cache_type": "q8_0",
     "expected_parallel_slots": 0,
     "expected_context_per_slot": 0,
     "capacity_test_input_tokens": 65536,
@@ -156,7 +162,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 "model_file": cluster_env.get("MODEL_FILE", ""),
                 "model_quant": cluster_env.get("MODEL_QUANT", ""),
                 "model_alias": cluster_env.get("MODEL_ALIAS", ""),
+                "model_revision": cluster_env.get("MODEL_REVISION", ""),
                 "tensor_split": cluster_env.get("TENSOR_SPLIT", ""),
+                "kv_cache_type": cluster_env.get("KV_CACHE_TYPE", ""),
             }
         )
 
@@ -188,7 +196,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config["iperf_port"] = _as_int(config.get("iperf_port"), 5201)
     config["parallel_slots"] = _as_int(config.get("parallel_slots"), 2)
     config["context_per_slot"] = _as_int(
-        config.get("context_per_slot"), 262144
+        config.get("context_per_slot"), 524288
     )
     config["native_context_per_slot"] = _as_int(
         config.get("native_context_per_slot"), 262144
@@ -197,6 +205,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         config.get("context_scaling", "native")
     ).lower()
     config["yarn_rope_scale"] = _as_float(config.get("yarn_rope_scale"), 0.0)
+    config["model_revision"] = str(config.get("model_revision", ""))
+    config["tensor_split"] = str(config.get("tensor_split", ""))
+    config["kv_cache_type"] = str(config.get("kv_cache_type", ""))
     expected_parallel = _as_int(config.get("expected_parallel_slots"), 0)
     config["expected_parallel_slots"] = (
         expected_parallel if expected_parallel > 0 else config["parallel_slots"]

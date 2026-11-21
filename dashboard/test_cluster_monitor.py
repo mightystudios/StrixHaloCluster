@@ -78,6 +78,9 @@ class PeerConfigurationTests(unittest.TestCase):
             (
                 "NODE_ROLE=peer",
                 "MODEL_QUANT=UD-Q4_K_XL",
+                "MODEL_REVISION=f5d175de2cf7f720d45d6064019a81fcf056e986",
+                "TENSOR_SPLIT=20,80",
+                "KV_CACHE_TYPE=q8_0",
                 "PARALLEL_SLOTS=3",
                 "CONTEXT_PER_SLOT=196608",
             )
@@ -124,7 +127,7 @@ class DashboardCapacityTests(unittest.TestCase):
 
         self.assertEqual([slot["id"] for slot in selected], [0])
 
-    def test_capacity_request_honors_end_of_sequence(self) -> None:
+    def test_capacity_request_ignores_end_of_sequence(self) -> None:
         started = threading.Event()
         release = threading.Event()
         captured: list[dict[str, object]] = []
@@ -174,7 +177,7 @@ class DashboardCapacityTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.render())
         self.assertEqual(len(captured), 1)
-        self.assertFalse(captured[0]["ignore_eos"])
+        self.assertTrue(captured[0]["ignore_eos"])
         self.assertEqual(captured[0]["n_predict"], 2)
 
     def test_capacity_retries_transient_generation_error(self) -> None:
@@ -636,6 +639,8 @@ class InstalledConfigurationTests(unittest.TestCase):
             {
                 "model_alias": "qwen3.8-flash-next-q4",
                 "model_quant": "UD-Q4_K_XL",
+                "tensor_split": "20,80",
+                "kv_cache_type": "q8_0",
                 "installed_context_per_slot": 196608,
                 "installed_parallel_slots": 3,
             }
@@ -644,7 +649,7 @@ class InstalledConfigurationTests(unittest.TestCase):
         self.assertIn("## Installed Qwen configuration", rendered)
         self.assertIn(
             "| qwen3.8-flash-next-q4 | UD-Q4_K_XL | "
-            "196,608 tokens per slot (192 Ki) | Native | 3 |",
+            "196,608 tokens per slot (192 Ki) | Native | q8_0 | 20,80 | 3 |",
             rendered,
         )
 
@@ -677,7 +682,7 @@ class CapacityTimeoutTests(unittest.TestCase):
             parallel_slots=3,
         )
 
-        self.assertEqual(timeout, 21600)
+        self.assertEqual(timeout, 10800)
 
     def test_explicit_timeout_overrides_automatic_timeout(self) -> None:
         timeout = cluster_tests._capacity_timeout(
@@ -764,6 +769,12 @@ class DashboardConfigurationTests(unittest.TestCase):
 
         self.assertEqual(config["parallel_slots"], 2)
         self.assertEqual(config["expected_parallel_slots"], 2)
+        self.assertEqual(config["context_per_slot"], 524288)
+        self.assertEqual(config["expected_context_per_slot"], 524288)
+        self.assertEqual(config["context_scaling"], "yarn")
+        self.assertEqual(config["yarn_rope_scale"], 2.0)
+        self.assertEqual(config["expected_tensor_split"], "20,80")
+        self.assertEqual(config["expected_kv_cache_type"], "q8_0")
 
     def test_preserves_smaller_timing_defaults_over_installed_capacity(self) -> None:
         cluster_environment = {
@@ -829,6 +840,9 @@ class YarnConfigurationTests(unittest.TestCase):
             (
                 "NODE_ROLE=server",
                 "MODEL_QUANT=UD-Q4_K_XL",
+                "MODEL_REVISION=f5d175de2cf7f720d45d6064019a81fcf056e986",
+                "TENSOR_SPLIT=20,80",
+                "KV_CACHE_TYPE=q8_0",
                 "PARALLEL_SLOTS=3",
                 "CONTEXT_PER_SLOT=524288",
                 "NATIVE_CONTEXT_PER_SLOT=262144",
@@ -842,7 +856,10 @@ class YarnConfigurationTests(unittest.TestCase):
                 "[Service]",
                 "ExecStart=/usr/local/bin/llama-server \\",
                 "  --parallel 3 \\",
+                "  --tensor-split 20,80 \\",
                 "  --kv-unified-per-slot 524288 \\",
+                "  --cache-type-k q8_0 \\",
+                "  --cache-type-v q8_0 \\",
                 "  --override-kv qwen4exp.context_length=int:524288 \\",
                 "  --rope-scaling yarn \\",
                 "  --rope-scale 2 \\",

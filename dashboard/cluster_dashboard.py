@@ -200,19 +200,23 @@ def render_installed_configuration(config: dict[str, Any]) -> str:
         scale_text = "Native"
     else:
         scale_text = context_scaling
+    kv_cache = config.get("kv_cache_type")
+    tensor_split = config.get("tensor_split")
 
     return "\n".join(
         (
             "## Installed Qwen configuration",
             "Values loaded from the controller's Qwen installation at dashboard startup.",
             "",
-            "| Active model | Quantization level | Context window | Context scaling | Parallel slots |",
-            "| --- | --- | --- | --- | ---: |",
-            "| {model} | {quantization} | {context} | {scaling} | {parallel} |".format(
+            "| Active model | Quantization level | Context window | Context scaling | KV cache | Tensor split | Parallel slots |",
+            "| --- | --- | --- | --- | --- | --- | ---: |",
+            "| {model} | {quantization} | {context} | {scaling} | {kv_cache} | {tensor_split} | {parallel} |".format(
                 model=_configuration_value(model),
                 quantization=_configuration_value(quantization),
                 context=_configuration_value(context_text),
                 scaling=_configuration_value(scale_text),
+                kv_cache=_configuration_value(kv_cache),
+                tensor_split=_configuration_value(tensor_split),
                 parallel=_configuration_value(parallel_slots),
             ),
         )

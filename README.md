@@ -8,7 +8,7 @@ This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over 
 
 - Turnkey scripts. Start with a fresh Ubuntu install and the scripts handle all the rest.
 - The tested Bosgame M5 nodes are linked over USB4. The verifier targets at least 8 Gbit/s over the private link. A USB4 data cable is required. I use https://link.amazon/B03prmZHS
-- Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. The default Q4 profile uses two slots and a `24,76` controller-to-worker tensor split to reserve more controller memory for ComfyUI.
+- Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. The default profile pins Unsloth Dynamic v3.1 `UD-Q4_K_XL` with two 512 Ki-token slots, Q8 KV, and a `20,80` controller-to-worker tensor split to reserve controller memory for ComfyUI.
 - ComfyUI is installed on both nodes with a shared workspace for models, custom-node source, workflows, inputs, and outputs. The controller service is active by default; the peer service is installed in standby to protect the Qwen RPC worker.
 - Native Hunyuan3D workflows use an automatically selected, ComfyUI-only SDPA compatibility policy for the Radeon 8060S. The installer prefers default attention when it passes an exact-shape GPU probe and otherwise enables the verified Math SDPA fallback.
 - The controller exposes the shared ComfyUI workspace as an anonymous, read/write `comfyui` share so Windows clients can manage models, custom-node source, workflows, inputs, and outputs without SSH.
@@ -127,9 +127,9 @@ sudo bash setup-environment.sh --role peer --user <linux-user>    # peer
 sudo bash verify-environment.sh  # server
 sudo bash verify-environment.sh  # peer
 
-# 3. Distributed Qwen3.8: two slots with controller headroom for ComfyUI
-sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 256 --skip-foundation # server
-sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 24,76 --context 256 --skip-foundation   # peer
+# 3. Distributed Qwen3.8: two extended slots with controller headroom for ComfyUI
+sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --parallel 2 --balance 20,80 --context 512 --kv-cache q8_0 --skip-foundation # server
+sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --parallel 2 --balance 20,80 --context 512 --kv-cache q8_0 --skip-foundation   # peer
 
 # 4. Optional ComfyUI: active on the controller, installed in standby on the peer
 sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role server --service-mode active --user <linux-user>   # server
@@ -142,13 +142,12 @@ sudo bash dashboard/setup-dashboard.sh --role peer  # peer
 
 The controller downloads the model and serves the API; the worker provides the USB4 RPC service. If you skip the preliminary environment step, omit `--skip-foundation` from `setup-qwen3d8.sh` and let that script run it.
 
-For two Q4 slots with an extended 512 Ki-token-per-slot context, replace
-`--context 256` with `--context 512` in both Qwen setup commands. Keep
-`--balance 24,76` to reserve controller headroom for ComfyUI. The installer
-automatically configures 2x YaRN scaling and the required temporary GGUF
-metadata override; run the two-user capacity test and a representative
-controller ComfyUI workflow together before using the extended window in
-production.
+The default Q4 profile shown above automatically configures 2x YaRN scaling
+and the required temporary GGUF metadata override for 512 Ki tokens per slot.
+Q8 KV reduces the two-slot cache estimate from 24 GiB to 14 GiB, while the
+`20,80` split reserves more controller headroom for ComfyUI. Run the two-user
+capacity test and a representative controller ComfyUI workflow together before
+using the extended window in production.
 
 ## Scripts
 
@@ -164,7 +163,7 @@ production.
 
 - USB4: `usb4llm0`, controller `10.200.0.1`, worker `10.200.0.2`
 - RPC worker: private TCP port `50053`
-- Qwen3.8: Q4, two parallel inference slots, `24,76` controller-to-worker balance, and 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki tokens per slot, or `--context 512` for Q4 with automatic 2x YaRN scaling
+- Qwen3.8: pinned Dynamic v3.1 `UD-Q4_K_XL`, two parallel 512 Ki-token slots, Q8 KV, and a `20,80` controller-to-worker balance with automatic 2x YaRN scaling
 - Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1/`
 - Cluster dashboard: `http://<controller>:7860` after installing `dashboard/setup-dashboard.sh`
 - ComfyUI: controller at `http://<controller>:8188`; peer installed in standby
